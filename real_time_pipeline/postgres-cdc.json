@@ -1,0 +1,27 @@
+{
+    "name": "postgres-cdc",
+    "config": {
+        "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+        "database.hostname": "postgres",
+        "database.port": "5432",
+        "database.user": "postgres",
+        "database.password": "postgres",
+        "database.server.name": "DockerServer",
+        "database.dbname": "demo_db",
+        "transforms": "flatten,routeTopic",
+        "transforms.flatten.type": "org.apache.kafka.connect.transforms.Flatten$Value",
+        "transforms.flatten.delimiter": ".",
+        "transforms.routeTopic.type": "org.apache.kafka.connect.transforms.RegexRouter",
+        "transforms.routeTopic.regex": "DockerServer.public.(.*)",
+        "transforms.routeTopic.replacement": "demo_data",
+        "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+        "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+        "key.converter.schemas.enable": "false",
+        "value.converter.schemas.enable": "false",
+        "decimal.format": "BASE64",
+        "plugin.name": "pgoutput",
+        "publication.name": "dbz_publication",
+        "table.include.list": "public.demo_table1,public.demo_table2",
+        "slot.name": "debezium"
+    }
+}

@@ -1,0 +1,11 @@
+Add Kafka Connect:
+curl -i -X POST -H "Accept:application/json" -H "Content-Type:application/json" localhost:8083/connectors --data @postgres-cdc.json
+
+curl -i -X POST -H "Accept:application/json" -H "Content-Type:application/json" localhost:8083/connectors --data @clickhouse-sinker.json
+
+
+Delete Kafka Connect:
+curl -X DELETE http://localhost:8083/connectors/postgres-cdc
+
+Kafka Mastodon:
+python mastodon_listener.py --baseURL https://mastodon.social/public --public --enableKafka --quiet --watchdog 3
