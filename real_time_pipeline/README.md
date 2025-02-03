@@ -153,9 +153,20 @@ curl -X POST -H "Content-Type: application/json" \
 ---
 
 ### Future Improvements
-- Implement monitoring and logging for easier debugging.
-- Optimize Kafka topic partitions for better scalability.
-- Improve sentiment analysis accuracy with fine-tuned models.
+1. Monitoring
+- Implement monitoring and alerting for easier debugging.
+- Could use Prometheus + Grafana for real-time metrics and visualization.
+- Set up alerting rules to detect failures in CDC ingestion and Flink processing.
+
+2. CDC Ingestion
+- Encode CDC data using Protobuf for efficient serialization.
+- Add a schema registry to manage and validate data schemas dynamically.
+- Optimize Kafka topic partitions to ensure better scalability and load balancing.
+
+3. LLM
+- Use a larger model, such as `deepseek-r1:7b`, for improved accuracy.
+- Deploy using vLLM on a GPU-enabled environment for faster inference.
+- Fine-tune sentiment analysis models on domain-specific datasets to improve classification precision.
 
 ---
 
