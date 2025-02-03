@@ -23,7 +23,7 @@ This project demonstrates a modern real-time data pipeline implementation with t
 ```mermaid
 graph LR
     A[PostgreSQL] -->|Debezium CDC| B(Kafka)
-    B --> C[ClickHouse Sink]
+    B -->|Kafka Sink| C[ClickHouse]
 ```
 
 ### Deployment Steps
@@ -66,8 +66,9 @@ Start the required services (Zookeeper, Kafka, PostgreSQL, ClickHouse, and Kowl 
 graph LR
     A[Mastodon] -->|Stream| B(Kafka)
     B --> C[Flink Processing]
-    C -->|Sentiment Scores| D[ClickHouse]
-    C -->|LLM Context| E[DeepSeek]
+    C -->|LLM Context + Content| E[Ollama:DeepSeek]
+    E -->|Sentiment Result| C[Flink Processing]
+    C -->|Post + Sentiment| D[ClickHouse]
 ```
 
 ### 2.1 Mastodon Producer
