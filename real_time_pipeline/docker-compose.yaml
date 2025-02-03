@@ -93,8 +93,9 @@ services:
       - -c
       - |
         echo "Installing connector plugins"
-        confluent-hub install --no-prompt debezium/debezium-connector-postgresql:1.5.0
+        wget -P /usr/share/confluent-hub-components "https://d2p6pa21dvn84.cloudfront.net/api/plugins/debezium/debezium-connector-postgresql/versions/1.5.0/debezium-debezium-connector-postgresql-1.5.0.zip"
         wget -P /usr/share/confluent-hub-components "https://d2p6pa21dvn84.cloudfront.net/api/plugins/clickhouse/clickhouse-kafka-connect/versions/v1.2.6/clickhouse-clickhouse-kafka-connect-v1.2.6.zip"
+        confluent-hub install --no-prompt /usr/share/confluent-hub-components/debezium-debezium-connector-postgresql-1.5.0.zip
         confluent-hub install --no-prompt /usr/share/confluent-hub-components/clickhouse-clickhouse-kafka-connect-v1.2.6.zip
 
         #

@@ -4,6 +4,7 @@ services:
     image: pyflink:1.14.0
     volumes:
     - ./code:/home/pyflink
+    working_dir: /home/pyflink
     ports:
       - "8085:8081"
     command: jobmanager

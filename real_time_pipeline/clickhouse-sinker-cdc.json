@@ -1,5 +1,5 @@
 {
-    "name": "clickhouse-sinker",
+    "name": "clickhouse-sinker-cdc",
     "config": {
         "connector.class": "com.clickhouse.kafka.connect.ClickHouseSinkConnector",
         "topics": "demo_data",
