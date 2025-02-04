@@ -178,6 +178,27 @@ curl -X POST -H "Content-Type: application/json" \
 - ClickHouse: `http://localhost:8123`
 
 ---
+
+## References
+
+#### Mastodon Stream
+- [GitHub: Mastodon Stream](https://github.com/saubury/mastodon-stream)
+
+#### Flink
+- [Building a Real-Time Pipeline for Data Analysis with GPT Models](https://aiven.io/developer/building-a-real-time-pipeline-for-data-analysis-with-gpt-models)
+- [Setup PyFlink Development Environment](https://wicaksonodiaz.medium.com/setup-pyflink-development-environment-76d8491a9ad7)
+- [PyFlink Deep Dive](https://quix.io/blog/pyflink-deep-dive)
+
+#### Install LLM
+- [How to Install and Use DeepSeek R1](https://medium.com/@pedro.aquino.se/how-to-install-and-use-deepseek-r1-a-free-and-privacy-first-alternative-to-openai-save-c838d2e5e04a)
+- [Ollama Docker Repository](https://github.com/valiantlynx/ollama-docker/tree/main)
+
+#### Debezium + Kafka
+- [Efficient Data Streaming with Kafka Connect and Debezium](https://batuhanorhon.medium.com/efficient-data-streaming-implementing-kafka-connect-and-debezium-with-docker-f5a5d24f5aca)
+- [CDC: PostgreSQL to ClickHouse](https://github.com/ClickHouse/examples/tree/main/cdc-postgresql-clickhouse)
+
+---
+
 ## Contribution
 
 This project is a work in progress. Contributions and improvements are welcome!
