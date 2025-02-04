@@ -1,0 +1,21 @@
+version: '3'
+services:
+  mastodon-producer:
+    image: python:3.9-slim
+    container_name: mastodon-producer
+    volumes:
+      - .:/root
+    working_dir: /root
+    command:
+    - bash
+    - -c
+    - |
+      pip install -r requirements.txt
+      sleep infinity
+    networks:
+      - mastodon-docker
+
+networks:
+  mastodon-docker:
+    name: docker_network
+    external: true

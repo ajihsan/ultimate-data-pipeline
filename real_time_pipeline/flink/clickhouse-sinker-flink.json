@@ -1,0 +1,21 @@
+{
+    "name": "clickhouse-sinker-flink",
+    "config": {
+        "connector.class": "com.clickhouse.kafka.connect.ClickHouseSinkConnector",
+        "topics": "mastodon_sentiment",
+        "ssl": "false",
+        "security.protocol": "SASL_PLAINTEXT",
+        "behavior.on.null.values": "ignore",
+        "behavior.on.error": "ignore",
+        "hostname": "clickhouse-server",
+        "database": "default",
+        "port": "8123",
+        "value.converter.schemas.enable": "false",
+        "batch.json.as.array": "true",
+        "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+        "exactlyOnce": "false",
+        "user": "default",
+        "username": "default",
+        "schemas.enable": "false"
+    }
+  }
