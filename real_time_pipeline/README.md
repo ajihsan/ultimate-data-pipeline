@@ -16,7 +16,7 @@ This project demonstrates a modern real-time data pipeline implementation with t
 - `curl` (for API requests)
 - Add new Docker network `docker_network`
 ```bash
-   docker network create docker_network
+docker network create docker_network
 ```
 
 ---
