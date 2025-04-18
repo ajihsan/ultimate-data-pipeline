@@ -1,0 +1,23 @@
+name: Test CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+ build:
+   runs-on: ubuntu-latest
+
+   steps:
+     - name: Get Your Code
+       uses: actions/checkout@v2
+
+     - name: Say Hello to the World
+       run: echo "Hello, World!"
+ 
+
