@@ -13,9 +13,11 @@ dependencies = [
 # NOTE: torch / laya / transformers are intentionally NOT declared as project
 # dependencies. The pinned model runtime (torch 2.14.0+rocm10.1.0 TheRock wheels,
 # laya 0.4.6) lives in the project-local .venv installed during the S0 feasibility
-# spike; S5 wires the model server on top of it. A plain exact `uv sync` would
-# strip it from .venv — use `make sync` (uv sync --inexact). Plain `uv run` is
-# safe by default (it syncs inexcactly; only `uv run --exact` removes extras).
+# spike; S5 wires the model server on top of it. fastapi / uvicorn / httpx are
+# likewise undeclared .venv residents (S0 bench + S5 server/eval use them). A
+# plain exact `uv sync` would strip all of these from .venv — use `make sync`
+# (uv sync --inexact). Plain `uv run` is safe by default (it syncs inexcactly;
+# only `uv run --exact` removes extras).
 
 [dependency-groups]
 dev = [
@@ -27,6 +29,7 @@ dev = [
 [project.scripts]
 udp = "udp.cli:main"
 udp-generate = "udp.generator.tickets:main"
+udp-eval = "udp.jev_eval:main"
 
 [build-system]
 requires = ["hatchling"]

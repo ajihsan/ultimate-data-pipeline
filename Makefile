@@ -2,7 +2,7 @@
 # Plain `uv sync` exact-syncs .venv and would remove the S0 model runtime
 # (TheRock torch wheels + laya); `make sync` runs --inexact to preserve it.
 
-.PHONY: sync lint fmt typecheck test hooks model up up-mock down down-v logs demo load-test
+.PHONY: sync lint fmt typecheck test hooks model model-container up up-model up-mock down down-v logs demo load-test
 
 sync:
 	uv sync --inexact
@@ -23,10 +23,21 @@ hooks:
 	uvx prek run -a
 
 model:
-	@echo "wired in S5: uv run laya server"
+	# Host-run Laya server (127.0.0.1:8081). NOTE: on this box ufw drops
+	# container→host traffic, so the decide container can only reach this if
+	# a rule allows the docker subnets:
+	#   pkexec ufw allow from 172.16.0.0/12 to any port 8081 proto tcp
+	# Otherwise use `make model-container` (in-network, no root needed).
+	uv run python -m udp.model_server
+
+model-container:
+	docker compose --profile model up -d --wait model
 
 up:
 	docker compose up -d --wait
+
+up-model:
+	docker compose --profile model up -d --wait
 
 up-mock:
 	docker compose -f docker-compose.yaml -f compose.mock.yaml up -d --wait

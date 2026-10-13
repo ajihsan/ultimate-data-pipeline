@@ -1,5 +1,6 @@
-# Streaming infra (S3) + Connect pipelines & mock (S4).
+# S3 infra + S4 connect pipelines + S5 model server (profile `model`).
 # Notifier (S6) and conduit (S7) are appended by their own subtasks.
+# Default stack: `make up` (no model). Real-model stack: `make up-model`.
 #
 # Pinned images (linux/amd64, verified 2026-10-13):
 #   redpandadata/redpanda:v26.2.4             sha256:c98c2f04a751e6646012cc701bac5183252cee44c88ba1dfa412e4c7124f2e89
@@ -151,6 +152,47 @@ services:
       retries: 6
       start_period: 15s
 
+  # S5 — real Laya decision server, joined to the compose network as a
+  # container because ufw drops container→host INPUT on this box (a host-run
+  # `make model` is otherwise equivalent; see the decide service comment).
+  # The GPU is shared (jellyfin): the RX 6600 XT schedules /dev/kfd between
+  # processes, and host video/render GIDs (983/987) grant device access.
+  # The pinned model runtime is NOT baked into an image — the project .venv
+  # (TheRock torch + laya) and the .hf-cache weights are bind-mounted; only
+  # PYTHONPATH is pointed at them (the venv's python symlink is host-only).
+  # 127.0.0.1:8082 republishes /healthz + /v1/systemone for host-side evals.
+  model:
+    image: python:3.12-bookworm@sha256:5560e9ab8709f459489e5b8aa696eda8a07ef821e14bb122be62d91234bfa98b
+    profiles: ["model"]
+    command: ["python", "-m", "udp.model_server"]
+    working_dir: /app
+    environment:
+      MODEL_HOST: 0.0.0.0
+      MODEL_PORT: "8081"
+      HF_HOME: /app/.hf-cache
+      USE_TF: "0"
+      PYTHONPATH: /app/.venv/lib/python3.12/site-packages:/app/src
+    volumes:
+      - .:/app
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    group_add:
+      - "983" # host video gid (GPU access)
+      - "987" # host render gid (GPU access)
+    ports:
+      - "127.0.0.1:8082:8081" # host-side eval URL; never LAN-exposed
+    mem_limit: 5g
+    networks:
+      - udp-net
+    restart: on-failure
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=5)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+
   # S4 — ingest pipeline: tickets → udp.tickets_raw (DLQ: tickets_dlq).
   ingest:
     image: redpandadata/connect:4.113.0
@@ -180,15 +222,18 @@ services:
       start_period: 15s
 
   # S4 — decide pipeline: tickets → fast_decisions / model_decisions.
-  # MODEL_ENDPOINT_URL points at a host-run Laya (S5) by default; the
-  # compose.mock.yaml override retargets it at the in-network jev-mock.
+  # MODEL_ENDPOINT_URL defaults at the in-network model server (S5; see the
+  # `model` service below). A HOST-run model server (make model) stays
+  # selectable via MODEL_ENDPOINT_URL in .env — note that ufw drops
+  # container→host traffic on this box, so a host-run server additionally
+  # needs `ufw allow from 172.16.0.0/12 to any port 8081 proto tcp`.
   decide:
     image: redpandadata/connect:4.113.0
     command: ["run", "/etc/connect/decide.yaml"]
     volumes:
       - ./connect/decide.yaml:/etc/connect/decide.yaml:ro
     environment:
-      MODEL_ENDPOINT_URL: http://host.docker.internal:8081/v1/systemone
+      MODEL_ENDPOINT_URL: ${MODEL_ENDPOINT_URL:-http://model:8081/v1/systemone}
       CLICKHOUSE_DSN: clickhouse://${CLICKHOUSE_USER:-admin}:${CLICKHOUSE_PASSWORD:-udp-dev-password}@clickhouse:9000/${CLICKHOUSE_DB:-udp}?dial_timeout=10s
     extra_hosts:
       - "host.docker.internal:host-gateway"
