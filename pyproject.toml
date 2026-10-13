@@ -1,0 +1,70 @@
+[project]
+name = "udp"
+version = "0.1.0"
+description = "Ultimate Data Pipeline — realtime ticket stream: ingest, cascade decision, ClickHouse, alerting."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "confluent-kafka>=2.6",
+    "pydantic>=2.9",
+    "faker>=30",
+]
+
+# NOTE: torch / laya / transformers are intentionally NOT declared as project
+# dependencies. The pinned model runtime (torch 2.14.0+rocm10.1.0 TheRock wheels,
+# laya 0.4.6) lives in the project-local .venv installed during the S0 feasibility
+# spike; S5 wires the model server on top of it. A plain exact `uv sync` would
+# strip it from .venv — use `make sync` (uv sync --inexact). Plain `uv run` is
+# safe by default (it syncs inexcactly; only `uv run --exact` removes extras).
+
+[dependency-groups]
+dev = [
+    "mypy>=1.18",
+    "pytest>=8.4",
+    "ruff>=0.17",
+]
+
+[project.scripts]
+udp = "udp.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/udp"]
+
+[tool.uv]
+# .venv intentionally also holds the S0 model runtime (torch+laya), which is not
+# part of the lockfile. See the NOTE above the [dependency-groups] table.
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+# docs/feasibility.md embeds the S0 spike script; the formatter would rewrite
+# its code blocks. Keep S0 docs byte-identical.
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+]
+
+[tool.mypy]
+files = ["src"]
+python_version = "3.12"
+disallow_untyped_defs = true
+warn_unused_ignores = true
+check_untyped_defs = true
+warn_return_any = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
