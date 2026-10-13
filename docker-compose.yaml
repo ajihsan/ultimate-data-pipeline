@@ -1,5 +1,5 @@
-# S3 infra + S4 connect pipelines + S5 model server (profile `model`).
-# Notifier (S6) and conduit (S7) are appended by their own subtasks.
+# S3 infra + S4 connect pipelines + S5 model server (profile `model`) +
+# S6 notify pipeline. Conduit (S7) is appended by its own subtask.
 # Default stack: `make up` (no model). Real-model stack: `make up-model`.
 #
 # Pinned images (linux/amd64, verified 2026-10-13):
@@ -239,6 +239,44 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       - "127.0.0.1:4197:4195" # /metrics + /ping republished for host curl
+    mem_limit: 250m
+    networks:
+      - udp-net
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+    restart: on-failure
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- 'http://localhost:4195/ping'"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  # S6 — notify pipeline: fast_decisions + model_decisions → udp.alerts
+  # (+ delivery per NOTIFY_PROVIDER; log = safe default with no receiver,
+  # compose.mock.yaml switches it to the mock alert receiver).
+  notify:
+    image: redpandadata/connect:4.113.0
+    command: ["run", "/etc/connect/notify.yaml"]
+    volumes:
+      - ./connect/notify.yaml:/etc/connect/notify.yaml:ro
+    environment:
+      NOTIFY_PROVIDER: ${NOTIFY_PROVIDER:-log}
+      ALERT_RECEIVER_URL: ${ALERT_RECEIVER_URL:-http://alert-receiver:8082/alerts}
+      ALERT_RATE_LIMIT_PER_MIN: ${ALERT_RATE_LIMIT_PER_MIN:-10}
+      THRESHOLD_ESCALATE_P: ${THRESHOLD_ESCALATE_P:-0.75}
+      THRESHOLD_SCAM_P: ${THRESHOLD_SCAM_P:-0.35}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+      CLICKHOUSE_DSN: clickhouse://${CLICKHOUSE_USER:-admin}:${CLICKHOUSE_PASSWORD:-udp-dev-password}@clickhouse:9000/${CLICKHOUSE_DB:-udp}?dial_timeout=10s
+    ports:
+      - "127.0.0.1:4198:4195" # /metrics + /ping republished for host curl
     mem_limit: 250m
     networks:
       - udp-net

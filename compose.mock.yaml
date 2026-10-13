@@ -1,11 +1,14 @@
 # S4 override: adds the mock Jev decision server (stand-in for the S5 Laya
 # server) and retargets the decide pipeline at it.
+# S6 override: adds the mock alert receiver and switches the notify pipeline
+# to it (NOTIFY_PROVIDER=mock).
 #
 #   docker compose -f docker-compose.yaml -f compose.mock.yaml up -d --wait
 #   (make up-mock)
 #
 # Without this override the decide service points at
-# host.docker.internal:8081 for a future host-run Laya (S5).
+# host.docker.internal:8081 for a future host-run Laya (S5) and the notify
+# service keeps its base NOTIFY_PROVIDER (log).
 services:
   jev-mock:
     build:
@@ -23,9 +26,36 @@ services:
       retries: 12
       start_period: 5s
 
+  # S6 — in-memory alert receiver: POSTs from the notify pipeline are recorded
+  # with receipt times for verification joins. In-network only (no host port);
+  # reachable as alert-receiver:8082 from the compose network.
+  alert-receiver:
+    build:
+      context: .
+      dockerfile: docker/alert-receiver.Dockerfile
+    image: udp/alert-receiver:4.113.0-s6
+    mem_limit: 150m
+    networks:
+      - udp-net
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8082/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
   decide:
     environment:
       MODEL_ENDPOINT_URL: http://jev-mock:8081/v1/systemone
     depends_on:
       jev-mock:
+        condition: service_healthy
+
+  notify:
+    environment:
+      NOTIFY_PROVIDER: mock
+      ALERT_RECEIVER_URL: http://alert-receiver:8082/alerts
+    depends_on:
+      alert-receiver:
         condition: service_healthy

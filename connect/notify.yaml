@@ -1,0 +1,402 @@
+# S6 — notify pipeline: fast_decisions + model_decisions → udp.alerts + delivery.
+#
+# QUALIFYING RULE TABLE — a decision becomes an alert iff it matches:
+#   source=model: escalate_probability ≥ THRESHOLD_ESCALATE_P (default 0.75) OR
+#                 scam_probability ≥ THRESHOLD_SCAM_P (default 0.35)
+#   source=fast:  category == scam_report AND confidence ≥ 0.85 (rule-tier
+#                 confidence floor; the fast path stamps scam_report at 0.95)
+#   degraded model rows NEVER qualify (p = 0 → below both thresholds; also
+#   checked explicitly). Non-qualifying decisions produce NO alert row at all —
+#   they are already recorded in the fast_decisions / model_decisions tables.
+#
+# DEDUPE — keyed by decision_id (the fast path has none, so the key is
+# synthesized as fast:<event_id>). The alerts row IS the dedupe record: before
+# any alert work, count() on udp.alerts WHERE decision_id = ?; a hit means the
+# decision already alerted → drop. This is replay-safe across SIGKILL/restart
+# (kafka_franz re-delivers ~10s of uncommitted traffic — S5b carry-forward —
+# every replayed qualifying decision is caught by the check). A RAM cache+TTL
+# dedupe would lie after a failed insert (key set, row not written → the
+# redelivered copy is dropped and the alert is lost forever), so no cache is
+# used here; the check costs one point query per qualifying decision.
+#
+# RATE LIMIT — K = ALERT_RATE_LIMIT_PER_MIN (default 10) alerts per epoch
+# minute, DROP-AND-RECORD: the native rate_limit processor would throttle and
+# backpressure the stream instead of deciding per message. A ttlru cache
+# (TTL 600s) holds the minute-window counter under key
+# alert-count-<epoch-minute>: read it, then branch — count < K → increment
+# (set count+1) + deliver; count ≥ K → suppressed path (the alerts row is
+# still written with suppressed=true; nothing silently lost) and the
+# notify_suppressed_total counter. The counter counts attempts, so exactly K
+# alerts per minute are delivered. Reads/writes are serialized:
+# pipeline.threads 1 (one processing goroutine) → no counter races. The
+# counter lives in RAM: a restart mid-minute re-arms the window (the durable
+# dedupe still prevents double rows). A counter read/update failure logs and
+# degrades the guardrail for that window (fail-open) — it never blocks rows.
+#
+# DELIVERY — the sql_insert output ALWAYS writes the alerts row (delivered or
+# suppressed; batching count: 1 → one insert per message, minimal redelivery
+# window). The notification runs as pipeline processors BEFORE the insert:
+# per NOTIFY_PROVIDER (comma-separated, any of):
+#   log      DEFAULT — no HTTP; the alert summary is logged (safe with no
+#            receiver — the base stack is self-sufficient).
+#   mock     POST ALERT_RECEIVER_URL — the compose.mock.yaml alert-receiver
+#            records payloads in memory for verification joins.
+#   telegram POST https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage
+#            body {"chat_id": TELEGRAM_CHAT_ID, "text": summary}
+#   discord  POST ${DISCORD_WEBHOOK_URL}, body {"content": summary}
+#   e.g. NOTIFY_PROVIDER=telegram,discord fans out to both per alert.
+# A failed POST retries (timeout 3s, 2 retries, backoff on 429/503), then is
+# CAUGHT and logged (notify_delivery_failed_total) — the alerts row still
+# lands (the design's "do NOT lose the alerts row"). At-least-once applies to
+# notifications (a CH outage between POST and insert can re-notify on
+# redelivery); rows are effectively exactly-once via the dedupe check.
+#
+# The udp.alerts channel column records the delivery channel: telegram |
+# discord | telegram,discord | mock (mock is also the log-mode value — the S2
+# AlertEvent enum has no "log"; alerts are ClickHouse-only, never a wire
+# payload, so no schema violation is possible).
+#
+# GO-LIVE with real channels (untestable in this homelab — verification runs
+# the log/mock modes): create a Telegram bot via @BotFather, get a chat id
+# (e.g. @userinfobot), then set in .env:
+#   TELEGRAM_BOT_TOKEN=<bot token>
+#   TELEGRAM_CHAT_ID=<chat id>
+#   NOTIFY_PROVIDER=telegram          (or telegram,discord)
+# Discord: channel → Integrations → Webhooks → copy the webhook URL, then set:
+#   DISCORD_WEBHOOK_URL=<webhook url>
+#   NOTIFY_PROVIDER=discord           (or telegram,discord)
+#
+# Health: GET :4195/ping; metrics: :4195/metrics.
+
+http:
+  address: 0.0.0.0:4195
+
+cache_resources:
+  - label: rate_window
+    ttlru:
+      default_ttl: 600s
+
+input:
+  broker:
+    inputs:
+      # S5b carry-forward: checkpoint_limit 1024 bounds restart redelivery to
+      # ~10s of traffic; the durable dedupe makes every replay a no-op.
+      - kafka_franz:
+          seed_brokers:
+            - redpanda:29092
+          topics:
+            - fast_decisions
+          consumer_group: udp-notify-fast
+          start_from_oldest: true
+          checkpoint_limit: 1024
+      - kafka_franz:
+          seed_brokers:
+            - redpanda:29092
+          topics:
+            - model_decisions
+          consumer_group: udp-notify-model
+          start_from_oldest: true
+          checkpoint_limit: 1024
+
+pipeline:
+  # One worker serializes the rate counter and the dedupe check (see header).
+  threads: 1
+  processors:
+    # Normalize both decision shapes into one evaluation record. The fast path
+    # has no decision_id — synthesize fast:<event_id> as its dedupe key.
+    # Unparseable topic bytes are dropped (decisions tables already hold the
+    # parsed copies; ingest DLQ'd anything worse).
+    - try:
+        - mapping: |
+            root = match {
+              this.decision_id != null => {
+                "source": "model",
+                "event_id": this.event_id | "",
+                "decision_id": this.decision_id,
+                "category": null,
+                "confidence": null,
+                "escalate_probability": this.escalate_probability | 0.0,
+                "scam_probability": this.scam_probability | 0.0,
+                "degraded": this.degraded | false,
+                "decided_at": this.decided_at | now(),
+                "schema_version": this.schema_version | "",
+              }
+              _ => {
+                "source": "fast",
+                "event_id": this.event_id | "",
+                "decision_id": "fast:" + (this.event_id | ""),
+                "category": this.category | "",
+                "confidence": this.confidence | 0.0,
+                "escalate_probability": null,
+                "scam_probability": null,
+                "degraded": false,
+                "decided_at": this.decided_at | now(),
+                "schema_version": this.schema_version | "",
+              }
+            }
+    - catch:
+        - log:
+            level: WARN
+            message: "notify: malformed decision dropped (${! error() })"
+        - mapping: 'root = deleted()'
+    # Qualifying rule table (header) — thresholds arrive from the environment
+    # at config parse time (compose passes THRESHOLD_*; S5-final values).
+    - mapping: |
+        root = this
+        root.qualifies = match {
+          this.degraded == true => false
+          this.source == "model" => this.escalate_probability >= (${THRESHOLD_ESCALATE_P}) || this.scam_probability >= (${THRESHOLD_SCAM_P})
+          _ => this.category == "scam_report" && this.confidence >= 0.85
+        }
+    - switch:
+        - check: '!(this.qualifies == true)'
+          processors:
+            - mapping: 'root = deleted()'
+    # The record rides in metadata from here: the sql_select below (and any
+    # notification HTTP call) replaces the payload, the record is restored
+    # after each such step.
+    - mapping: 'meta alert_record = this.string()'
+    # DEDUPE (authoritative, restart-safe — see header): an existing alerts
+    # row for this decision_id means the decision already alerted. Unguarded
+    # on purpose: a CH failure must error the message so the output switch
+    # nacks it for redelivery instead of guessing the alert state.
+    - sql_select:
+        driver: clickhouse
+        dsn: ${CLICKHOUSE_DSN}
+        table: alerts
+        columns:
+          - count() as n
+        where: decision_id = ?
+        args_mapping: 'root = [ this.decision_id ]'
+    - mapping: |
+        root = meta("alert_record").parse_json()
+        # dedupe_checked is the "cleared for alerting" marker: it only exists
+        # on messages whose dedupe check ran clean. Every later branch and the
+        # output switch require it, so a failed check can never alert, insert,
+        # or be acked — it is nacked and redelivered instead. The stash is
+        # refreshed here so later restores keep the marker.
+        root.dedupe_checked = this.index(0).n == 0
+        # NOTE: meta assignments flush when the mapping completes, so this
+        # overwrites the step-4 stash only for LATER mappings — exactly what
+        # the restores below need. `root`, not `this` (this is still the
+        # sql_select result array at this point).
+        meta alert_record = root.string()
+    - switch:
+        - check: 'this.dedupe_checked == false'
+          processors:
+            - mapping: 'root = deleted()'
+    # RATE LIMIT window counter (drop-and-record — see header). A miss means
+    # the first alert of this minute: count 0.
+    - try:
+        - cache:
+            resource: rate_window
+            key: 'alert-count-${! (timestamp_unix() / 60).floor() }'
+            operator: get
+    - catch:
+        - log:
+            level: WARN
+            message: "notify: rate counter read failed (${! error() }) — treating as fresh window"
+    - catch: []
+    # Restore the record (a cache hit replaced the payload with the counter —
+    # auto-parsed to a JSON number, NOT a string), stamp the delivery channel,
+    # and branch under/at vs over the limit.
+    - mapping: |
+        let count = match {
+          this.type() == "object" => 0.0
+          _ => this.number()
+        }
+        root = match {
+          this.type() == "object" => this
+          _ => meta("alert_record").parse_json()
+        }
+        let providers = "${NOTIFY_PROVIDER}"
+        root.channel = match {
+          $providers.contains("telegram") && $providers.contains("discord") => "telegram,discord"
+          $providers.contains("telegram") => "telegram"
+          $providers.contains("discord") => "discord"
+          _ => "mock"
+        }
+        root.rate_count = $count
+    - switch:
+        # UNDER the limit: consume a slot, deliver, then the row finalizes
+        # suppressed=false. Guardrail failure logs + fails open (header).
+        - check: 'this.dedupe_checked == true && this.rate_count < ${ALERT_RATE_LIMIT_PER_MIN}'
+          processors:
+            - try:
+                - cache:
+                    resource: rate_window
+                    key: 'alert-count-${! (timestamp_unix() / 60).floor() }'
+                    operator: set
+                    value: '${! (this.rate_count + 1).string() }'
+            - catch:
+                - log:
+                    level: WARN
+                    message: "notify: rate counter update failed (${! error() }) — guardrail degraded for this window"
+            - catch: []
+            # Notification summary + stash (the POST bodies replace the
+            # payload; the finalize step restores from the stash).
+            - mapping: |
+                root = this
+                root.summary = match {
+                  this.source == "model" => "[udp/model] event=" + this.event_id + " decision=" + this.decision_id + " escalate_p=" + this.escalate_probability.string() + " scam_p=" + this.scam_probability.string()
+                  _ => "[udp/fast] event=" + this.event_id + " decision=" + this.decision_id + " category=" + this.category + " confidence=" + this.confidence.string()
+                }
+                meta notify_record = this.string()
+            # Provider: log (DEFAULT) and/or mock. No-op unless selected.
+            - switch:
+                - check: '"${NOTIFY_PROVIDER}".contains("log")'
+                  processors:
+                    - log:
+                        level: INFO
+                        message: 'notify (log): ${! this.summary }'
+                - check: '"${NOTIFY_PROVIDER}".contains("mock")'
+                  processors:
+                    - mapping: |
+                        root = {"event_id": this.event_id, "decision_id": this.decision_id, "source": this.source, "channel": "mock", "suppressed": false, "decided_at": this.decided_at, "created_at": now()}
+                    - try:
+                        - http:
+                            url: ${ALERT_RECEIVER_URL}
+                            verb: POST
+                            headers:
+                              Content-Type: application/json
+                            timeout: 3s
+                            retries: 2
+                            backoff_on:
+                              - 429
+                              - 503
+                            retry_period: 250ms
+                    - catch:
+                        - metric:
+                            type: counter
+                            name: notify_delivery_failed_total
+                        - log:
+                            level: WARN
+                            message: "notify: mock delivery failed (${! error() }) — alerts row still written"
+                    - catch: []
+            # Provider: telegram (no-op unless selected).
+            - switch:
+                - check: '"${NOTIFY_PROVIDER}".contains("telegram")'
+                  processors:
+                    - mapping: 'root = {"chat_id": "${TELEGRAM_CHAT_ID}", "text": this.summary}'
+                    - try:
+                        - http:
+                            url: https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage
+                            verb: POST
+                            headers:
+                              Content-Type: application/json
+                            timeout: 3s
+                            retries: 2
+                            backoff_on:
+                              - 429
+                              - 503
+                            retry_period: 250ms
+                    - catch:
+                        - metric:
+                            type: counter
+                            name: notify_delivery_failed_total
+                        - log:
+                            level: WARN
+                            message: "notify: telegram delivery failed (${! error() }) — alerts row still written"
+                    - catch: []
+            # Provider: discord (no-op unless selected).
+            - switch:
+                - check: '"${NOTIFY_PROVIDER}".contains("discord")'
+                  processors:
+                    - mapping: 'root = {"content": this.summary}'
+                    - try:
+                        - http:
+                            url: ${DISCORD_WEBHOOK_URL}
+                            verb: POST
+                            headers:
+                              Content-Type: application/json
+                            timeout: 3s
+                            retries: 2
+                            backoff_on:
+                              - 429
+                              - 503
+                            retry_period: 250ms
+                    - catch:
+                        - metric:
+                            type: counter
+                            name: notify_delivery_failed_total
+                        - log:
+                            level: WARN
+                            message: "notify: discord delivery failed (${! error() }) — alerts row still written"
+                    - catch: []
+            # Finalize the delivered row (restore past the notification POSTs).
+            - mapping: |
+                root = meta("notify_record").parse_json()
+                root.suppressed = false
+                root.created_at = now()
+        # AT/OVER the limit: drop-and-record — no delivery, row kept with
+        # suppressed=true so the alert trail stays complete in ClickHouse.
+        - check: 'this.dedupe_checked == true && this.rate_count >= ${ALERT_RATE_LIMIT_PER_MIN}'
+          processors:
+            - metric:
+                type: counter
+                name: notify_suppressed_total
+            - mapping: |
+                root = this
+                root.suppressed = true
+                root.created_at = now()
+
+output:
+  # The alerts row is ALWAYS written (delivered or suppressed — see header).
+  # strict_mode nacks anything that never finalized (dedupe-check failure,
+  # rate-restore failure) back to the input for redelivery — nothing silently
+  # lost. batching count: 1 inserts per message: the row lands before the
+  # input acks, so the dedupe check on any redelivery is always current.
+  switch:
+    strict_mode: true
+    cases:
+      - check: 'this.dedupe_checked == true && this.suppressed == false'
+        output:
+          sql_insert:
+            driver: clickhouse
+            dsn: ${CLICKHOUSE_DSN}
+            table: alerts
+            columns:
+              - decision_id
+              - event_id
+              - channel
+              - suppressed
+              - created_at
+              - schema_version
+            args_mapping: |
+              root = [
+                this.decision_id,
+                this.event_id,
+                this.channel,
+                false,
+                this.created_at.ts_format("2006-01-02 15:04:05.999", "UTC"),
+                this.schema_version,
+              ]
+            batching:
+              count: 1
+      - check: 'this.dedupe_checked == true && this.suppressed == true'
+        output:
+          sql_insert:
+            driver: clickhouse
+            dsn: ${CLICKHOUSE_DSN}
+            table: alerts
+            columns:
+              - decision_id
+              - event_id
+              - channel
+              - suppressed
+              - created_at
+              - schema_version
+            args_mapping: |
+              root = [
+                this.decision_id,
+                this.event_id,
+                this.channel,
+                true,
+                this.created_at.ts_format("2006-01-02 15:04:05.999", "UTC"),
+                this.schema_version,
+              ]
+            batching:
+              count: 1
+
+metrics:
+  prometheus: {}
