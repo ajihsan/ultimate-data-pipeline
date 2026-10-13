@@ -26,7 +26,7 @@ when every slot is taken the endpoint answers ``503`` with ``Retry-After: 0.1``
 (mirroring decide.yaml's ``backoff_on: [429, 503]`` + 100 ms ``retry_period``).
 Admitted requests serialize on a :class:`threading.Lock` around
 ``Agent.predict``. The slot count bounds worst-case queueing below decide's
-750 ms endpoint timeout (8 slots × ~64 ms ≈ 512 ms).
+1500 ms endpoint timeout (8 slots × ~64 ms ≈ 512 ms).
 
 The heavy runtime (torch + laya) is intentionally undeclared in pyproject and
 lives in the project-local ``.venv`` (see the pyproject NOTE); run with
@@ -89,9 +89,9 @@ DEFAULT_SLO_MS = 5000.0
 INERT by default: on this box the steady pipeline's concurrent bursts fit one
 batch-8 cohort (measured: 299/299 decisions non-degraded, zero refusals), and
 an active SLO converts those would-succeed requests into 503-retry gambles
-that occasionally exhaust into degraded rows. Lower it (e.g. 730, just under
-decide.yaml's 750 ms endpoint timeout) for workloads whose decide bursts run
-deeper than one cohort — refused requests retry with a fresh 750 ms budget
+that occasionally exhaust into degraded rows. Lower it (e.g. 1480, just under
+decide.yaml's 1500 ms endpoint timeout) for workloads whose decide bursts run
+deeper than one cohort — refused requests retry with a fresh 1500 ms budget
 instead of being admitted into a guaranteed client timeout (unrecoverable →
 degraded fallback). """
 
@@ -224,7 +224,7 @@ class InferenceGate:
     throughput path laya exists for: one forward pass per group of states
     instead of one per state. Measured on this GPU (2 questions/ticket):
     batch 1 = 6.0 tickets/s, batch 8 = 14.3 tickets/s at 558 ms — a full
-    cohort stays under decide.yaml's 750 ms endpoint timeout, which is what
+    cohort stays under decide.yaml's 1500 ms endpoint timeout, which is what
     lets bursty concurrent decide traffic finish non-degraded.
     """
 
@@ -371,7 +371,7 @@ def warmup(agent: LayaAgent) -> None:
     """Pre-fire the CUDA path with the pipeline's exact question shape.
 
     Without this, the first real request pays lazy kernel initialization
-    (seconds) and blows decide.yaml's 750 ms endpoint timeout — the first
+    (seconds) and blows decide.yaml's 1500 ms endpoint timeout — the first
     flagged tickets would all land in the degraded fallback. Three passes
     also let the CUDA memory pool reach its steady footprint before serving.
     """
@@ -499,7 +499,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
     # The consumer thread's per-batch decode work (numpy answer shaping between
     # torch ops) holds the GIL in long stretches; without a tighter switch
-    # interval the uvicorn event loop can stall long enough for decide's 750 ms
+    # interval the uvicorn event loop can stall long enough for decide's 1500 ms
     # client timeout to fire on connections that are still unaccepted.
     sys.setswitchinterval(0.0005)
     uvicorn.run(

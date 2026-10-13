@@ -21,11 +21,14 @@ Semantics:
 - **Rules 1–6 (confident):** a `FastDecision` is emitted to
   `udp.fast_decisions` + topic `fast_decisions`. The model is never called.
 - **Rules 7–8 (flagged):** the ticket is POSTed to `/v1/systemone`
-  (`MODEL_ENDPOINT_URL`, 750 ms timeout, 1 retry, backoff on 429/503). Every
+  (`MODEL_ENDPOINT_URL`, 1500 ms timeout, 1 retry, backoff on 429/503). Every
   flagged event yields a `ModelDecision` row — the model's answers on success,
   or a degraded fallback (`escalate_probability`/`scam_probability` = 0,
   `degraded = true`, `answers = {"error": <message>}`) when the endpoint fails;
   degraded verdicts increment the `model_degraded_total` Prometheus counter.
+  Concurrency is capped so that never happens in load: decide runs 4 pipeline
+  workers (`pipeline.threads`), so concurrent model calls cap at 4 → the
+  server's `predict_batch` cohorts stay ≤ 4 states (≤ ~310 ms ≪ 1500 ms).
 - Keyword lists are tuned against the S2 synthetic generator's template pool
   (seeded benchmark: 6000 events, seed 7 → 4.98% flagged). Real traffic will
   need tuning; the table exists so the fast path stays auditable and cheap.
