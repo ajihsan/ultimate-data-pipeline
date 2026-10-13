@@ -1,0 +1,160 @@
+# Streaming infra (S3) — redpanda, clickhouse, postgres, redpanda console.
+# Connect/mock (S4), notifier (S6) and conduit (S7) are appended by their own
+# subtasks; this file must stay green without them.
+#
+# Pinned images (linux/amd64, verified 2026-10-13):
+#   redpandadata/redpanda:v26.2.4             sha256:c98c2f04a751e6646012cc701bac5183252cee44c88ba1dfa412e4c7124f2e89
+#   clickhouse/clickhouse-server:26.9.13.15   sha256:04fc72b8a58e58200c706f375ef81ec7112de3515e898de63f6c72843d7a2eeb
+#   postgres:16-alpine                        sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+#   redpandadata/console:v3.12.0              sha256:9dc0cd55db172c6be9c2ff8a51f33a14395f7675fa7fbc002c277f3b96115c27
+#
+# Kafka listener layout (single-node dev):
+#   PLAINTEXT 29092 — intra-compose clients (console, S4 connect, S7 conduit)
+#   EXTERNAL  9092  — host clients, advertised as localhost:9092 so it matches
+#                     REDPANDA_BOOTSTRAP. A single PLAINTEXT listener advertised
+#                     as redpanda:9092 breaks host producers: after bootstrap the
+#                     broker returns redpanda:9092 in metadata, which the host
+#                     cannot resolve. Console binds host 8085 (8080 is
+#                     qBittorrent's WebUI on this shared homelab box).
+#
+# Every host port is bound to 127.0.0.1 — this is a shared homelab; nothing here
+# is reachable from the LAN. Memory caps: redpanda 1.5G, clickhouse 3G (with a
+# 2.5G server-side ceiling), postgres 256m, console 200m.
+
+name: udp
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v26.2.4
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp 1
+      - --memory 1G
+      - --reserve-memory 0M
+      - --node-id 0
+      - --kafka-addr PLAINTEXT://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:29092,EXTERNAL://localhost:9092
+    ports:
+      - "127.0.0.1:9092:9092"
+      - "127.0.0.1:9644:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    mem_limit: 1.5g
+    networks:
+      - udp-net
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:[[:space:]]*true'"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  redpanda-init:
+    image: redpandadata/redpanda:v26.2.4
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/bin/bash", "-euo", "pipefail", "-c"]
+    command:
+      - |
+        ensure() {
+          local t=$$1
+          if rpk -X brokers=redpanda:29092 topic describe "$$t" >/dev/null 2>&1; then
+            echo "topic exists: $$t"
+          else
+            rpk -X brokers=redpanda:29092 topic create "$$t" -c cleanup.policy=delete -c retention.ms=604800000
+          fi
+        }
+        ensure tickets
+        ensure fast_decisions
+        ensure model_decisions
+        ensure tickets_dlq
+        rpk -X brokers=redpanda:29092 topic list
+    networks:
+      - udp-net
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.9.13.15
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-udp-dev-password}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-udp}
+      # Server-side ceiling (2.5G) below the container cap so CH can never
+      # starve the rest of the homelab.
+      MAX_SERVER_MEMORY_USAGE_BYTES: "2684354560"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    ports:
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    mem_limit: 3g
+    networks:
+      - udp-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- 'http://localhost:8123/ping'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-udp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-udp-dev-password}
+      POSTGRES_DB: ${POSTGRES_DB:-udp}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    mem_limit: 256m
+    networks:
+      - udp-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  console:
+    image: redpandadata/console:v3.12.0
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+    environment:
+      # Env config = uppercased YAML paths (verified on v3.12.0: CONFIG_ prefix
+      # is not honoured by this version).
+      KAFKA_BROKERS: redpanda:29092
+      SERVER_ADDRESS: ":8080"
+    ports:
+      - "127.0.0.1:${REDPANDA_CONSOLE_PORT:-8085}:8080"
+    mem_limit: 200m
+    networks:
+      - udp-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- 'http://localhost:8080/' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+networks:
+  udp-net:
+    driver: bridge
+
+volumes:
+  redpanda-data:
+  clickhouse-data:
+  postgres-data:

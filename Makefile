@@ -2,7 +2,7 @@
 # Plain `uv sync` exact-syncs .venv and would remove the S0 model runtime
 # (TheRock torch wheels + laya); `make sync` runs --inexact to preserve it.
 
-.PHONY: sync lint fmt typecheck test hooks model up down logs demo load-test
+.PHONY: sync lint fmt typecheck test hooks model up down down-v logs demo load-test
 
 sync:
 	uv sync --inexact
@@ -26,13 +26,16 @@ model:
 	@echo "wired in S5: uv run laya server"
 
 up:
-	@echo "wired in S3 (docker compose up -d)"
+	docker compose up -d --wait
 
 down:
-	@echo "wired in S3 (docker compose down)"
+	docker compose down
+
+down-v:
+	docker compose down -v
 
 logs:
-	@echo "wired in S3 (docker compose logs -f)"
+	docker compose logs -f --tail 100
 
 demo:
 	@echo "wired in S8 (end-to-end demo run)"
