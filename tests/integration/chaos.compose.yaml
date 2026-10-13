@@ -1,0 +1,15 @@
+# S8 chaos-override: real-model stack WITH the mock alert receiver.
+#
+# compose.mock.yaml retargets the decide pipeline at the jev-mock server;
+# the chaos run needs the REAL model (compose profile `model`) while keeping
+# the receiver for delivery-latency receipts. This file re-points decide at
+# the in-network model server and is applied AFTER compose.mock.yaml:
+#
+#   docker compose -f docker-compose.yaml -f compose.mock.yaml \
+#     -f tests/integration/chaos.compose.yaml --profile model up -d --wait
+#
+# (see tests/integration/chaos.sh — the only consumer)
+services:
+  decide:
+    environment:
+      MODEL_ENDPOINT_URL: http://model:8081/v1/systemone

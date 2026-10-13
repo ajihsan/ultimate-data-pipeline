@@ -51,11 +51,19 @@ down-v:
 logs:
 	docker compose logs -f --tail 100
 
+# S8 demo = the full end-to-end acceptance on the REAL model stack: clean
+# slate → up-model → steady 2000 @ 100 ev/s → scam-spike burst → degraded=0,
+# delivery + rate-limit and CDC asserts. Phones aren't part of the harness —
+# alerts land on the in-network alert-receiver (swap NOTIFY_PROVIDER=telegram
+# in .env to watch them arrive on a real device).
 demo:
-	@echo "wired in S8 (end-to-end demo run)"
+	bash tests/integration/smoke.sh --model
 
+# S8 load + chaos acceptance (local-only, real model): 10 min @ 100 ev/s with
+# a mid-run `docker compose kill` of decide+notify — see
+# tests/integration/chaos.sh for the scenario and asserts.
 load-test:
-	@echo "wired in S8 (synthetic load test)"
+	bash tests/integration/chaos.sh
 
 # S7 — deterministic app_users mutations through the conduit bus CDC path
 # (postgres → pg_changes → app_users_cdc); prints each op for correlation.

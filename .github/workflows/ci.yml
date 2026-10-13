@@ -1,0 +1,82 @@
+# CI for the realtime pipeline. Mock-only by design: the smoke job runs the
+# compose.mock.yaml stack (jev-mock answers flagged tickets) with NO model
+# download, no GPU, and the model profile explicitly NOT started. Real-model
+# serving + the 10-min chaos/load acceptance are LOCAL-ONLY (needs the RX 6600
+# XT + TheRock wheels) — run `make load-test` on the bench box.
+#
+# prek (the pre-commit runner, Rust) is installed on the fly with `uvx prek` —
+# it builds isolated hook envs from .pre-commit-config.yaml, so no local hook
+# installation is needed (a plain `pip install prek` works too).
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uvx prek run -a
+
+  typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run mypy .
+
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run pytest
+
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Half-load, burstless CI sizing of the same harness `make demo` runs —
+      # mock decision server, mock alert receiver; the compose `model` profile
+      # is never started (no GPU exists on the runner anyway).
+      SMOKE_STEADY_COUNT: "1000"
+      SMOKE_STEADY_RATE: "50"
+      SMOKE_BURST_COUNT: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: bash tests/integration/smoke.sh --mock
+      - name: upload compose logs on failure
+        if: failure()
+        run: |
+          docker compose -f docker-compose.yaml -f compose.mock.yaml logs --tail 500 > compose-logs.txt || true
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: compose-logs
+          path: compose-logs.txt
+          if-no-files-found: ignore

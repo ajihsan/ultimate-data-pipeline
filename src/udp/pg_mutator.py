@@ -64,9 +64,7 @@ def _next_op(mode: str, i: int) -> str:
     return ("insert", "update", "delete")[i % 3]
 
 
-def _insert_one(
-    cur: psycopg.Cursor, rng: random.Random, seq: int, seed: int
-) -> int:
+def _insert_one(cur: psycopg.Cursor, rng: random.Random, seq: int, seed: int) -> int:
     """Insert one app_user; returns the new id.
 
     Email embeds the seed + sequence so the same seed always produces the
