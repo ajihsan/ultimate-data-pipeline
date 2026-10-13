@@ -58,7 +58,7 @@ Every host port is bound to 127.0.0.1 (shared homelab; nothing is LAN-reachable)
 ## Decision-path walkthrough (decide)
 
 1. `kafka_franz` input, group `udp-decide`, `checkpoint_limit 1024` (bounds crash redelivery to ~10s of traffic; the franz reader pauses the partition when pending ≥ limit — pending sawtooths ~100–150 at 100 ev/s thanks to the 100-row/1s output batcher).
-2. Rule table — deterministic FIRST-MATCH on the lowercased text (docs/rules.md is the human-readable mirror; tests assert the two stay in sync): scam_report 0.95 → billing/bug/access 0.90 → feature_request/complaint 0.85; no match → shape-ambiguous heuristics (garbled / >40% caps / ≥5 !? / <12 chars) flag at 0.40, else 0.45.
+2. Rule table — deterministic FIRST-MATCH on the lowercased text (docs/rules.md is the human-readable mirror): scam_report 0.95 → billing/bug/access 0.90 → feature_request/complaint 0.85; no match → shape-ambiguous heuristics (garbled / >40% caps / ≥5 !? / <12 chars) flag at 0.40, else 0.45.
 3. Confident verdict → FastDecision row + topic fan-out. Flagged → POST `/v1/systemone` (threads 4 caps concurrency at 4 → model cohorts ≤4 states → worst in-load service ≈310ms ≪ the 1500ms timeout; retries only on 429/503). Every flagged ticket yields a ModelDecision row — real answers or a degraded fallback (`escalate=scam=0, degraded=true`, `model_degraded_total` counter).
 4. Measured on this GPU: ~95% fast (~2ms each) + ~5% model (≤310ms) → 230–360 msg/s steady throughput vs 100 ev/s inflow; fast-path p95 81ms, model-path p95 467ms end-to-end (docs/jev_eval.md has the full latency analysis).
 
@@ -72,11 +72,11 @@ Wire schemas (Ticket, FastDecision, ModelDecision, AlertEvent) and every ClickHo
 |---|---|
 | invalid ticket (malformed JSON / missing event_id·text·schema_version) | ingest routes a copy to topic `tickets_dlq` keyed by the reason; never silently dropped |
 | model endpoint down / timing out | decide stamps degraded fallback rows (p=0 → never alert) and keeps consuming; **model-tier alerting is down** while the endpoint is (fast path unaffected); SQL gauge: `SELECT count() FROM udp.model_decisions WHERE degraded AND decided_at > now() - INTERVAL 5 MINUTE` |
-| clickhouse insert failure | connect nacks and retries (`retry_until_success` on ingest; decide/notify outputs `strict_mode` + batching count:1 so an alert row lands before its input ack) |
+| clickhouse insert failure | connect nacks and retries (`retry_until_success` on ingest/decide; notify's output switch is `strict_mode` with batching count:1 so an alert row lands before its input ack) |
 | decide/notify SIGKILL | ~40s franz session-timeout rebalance, then replay of ≤~10s (checkpoint_limit 1024); replayed decisions/alerts are made no-ops by notify's dedupe; the fast/model decision tables grow a thin duplicate tail (read-time dedupe contract) |
 | pipeline (re)start, first fetch | one-time ~2–4.4s franz chunk warm-up before the first decisions land |
 | conduit restart | checkpoints (incl. the replication slot) persist in the `conduit-data` badger volume — resumes without re-snapshotting; replays re-append rows whose dedupe is read-time (argMax by kafka offset) |
-| alert POST failure | retried (3s timeout, 2 retries, backoff on 429/503), then logged (`notify_delivery_failed_total`) — the alerts row ALWAYS lands (delivered is at-least-once, rows are effectively exactly-once) |
+| alert POST failure | retried (3s timeout, 2 retries, backoff on 429/503), then logged (`notify_delivery_failed_total`) — the alerts row ALWAYS lands. Alerts are exactly-once per decision_id (dedupe on the alerts row), barring co-batched duplicates from an upstream producer retry; delivery itself is at-least-once |
 | rate limiter RAM counter loss | restart mid-minute re-arms the window (durable decision_id dedupe still prevents double rows); a counter read/update failure fails OPEN (guardrail degraded for that window, rows never blocked) |
 
 ## RAM / limits

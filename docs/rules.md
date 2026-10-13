@@ -34,5 +34,5 @@ Semantics:
   need tuning; the table exists so the fast path stays auditable and cheap.
 
 The YAML comment block in `connect/decide.yaml` is the source of truth the
-pipeline executes; `tests/test_rules_doc.py` asserts this doc and the YAML
-comment agree (priority order + categories + confidences).
+pipeline executes; `docs/rules.md` is its human-readable mirror (kept in sync
+by review — there is no doc-drift test).

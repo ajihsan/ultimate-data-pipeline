@@ -158,6 +158,12 @@ ONE question per decision; the wire contract sends two).
 
 ### Burst drain — `--profile demo --count 18000 --seed 7` (60 s, 300 ev/s)
 
+> **SUPERSEDED (S5b):** the 48% degraded rate below is the PRE-S5b result
+> (decide's 12-thread default oversubscribing the model path). S5b retuned
+> decide (threads 4, checkpoint_limit 1024 — see connect/decide.yaml) and the
+> same burst now finishes with **0/348 degraded**; the S8 acceptance table in
+> README.md is the current measurement. Kept for the root-cause record.
+
 | assertion | result |
 |---|---|
 | flagged count | 348 (≤360 budget ✓) |

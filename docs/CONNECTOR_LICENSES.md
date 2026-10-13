@@ -40,8 +40,11 @@ postgres app_users ──(conduit: snapshot + WAL/logrepl CDC)──► redpanda
   landing side is a plain connect pipeline (same shape as ingest/decide/
   notify — no new landing tech).
 - Landing is idempotent at read time: `app_users_cdc` is a MergeTree append
-  log; current state = `argMax(col, landed_at)` per id `WHERE op != 'd'`
-  (see `connect/cdc.yaml` + `clickhouse/cdc.sql`).
+  log; current state = `argMax(col, offset)` per id with
+  `HAVING argMax(op, offset) != 'd'` (keyed on the kafka offset, never
+  `landed_at`; tombstones dropped in the HAVING, not a plain WHERE — a
+  `WHERE op != 'd'` filter resurrects deleted ids; see `connect/cdc.yaml` +
+  `clickhouse/cdc.sql`).
 - Pinned: `ghcr.io/conduitio/conduit:v0.20.0` — v0.20.0 is the first stable
   release fixing a SEV-0 Postgres snapshot→CDC stall present in v0.19.0
   (snapshot completes, CDC silently never starts); v0.19.0 and older must

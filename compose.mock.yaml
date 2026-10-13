@@ -1,14 +1,11 @@
 # S4 override: adds the mock Jev decision server (stand-in for the S5 Laya
-# server) and retargets the decide pipeline at it.
+# server) and retargets the decide pipeline at it (the base stack points at
+# the real model container, http://model:8081).
 # S6 override: adds the mock alert receiver and switches the notify pipeline
-# to it (NOTIFY_PROVIDER=mock).
+# to it (NOTIFY_PROVIDER=mock; the base default is log).
 #
 #   docker compose -f docker-compose.yaml -f compose.mock.yaml up -d --wait
 #   (make up-mock)
-#
-# Without this override the decide service points at
-# host.docker.internal:8081 for a future host-run Laya (S5) and the notify
-# service keeps its base NOTIFY_PROVIDER (log).
 services:
   jev-mock:
     build:
