@@ -128,15 +128,17 @@ def test_concurrent_requests_are_answered() -> None:
     with TestClient(create_app(agent_factory=lambda: fake, slo_ms=10_000)) as client:
         import concurrent.futures
 
-        def post(i: int) -> int:
+        codes: list[int] = []
+
+        def post(i: int) -> None:
             resp = client.post(
                 "/v1/systemone",
                 json={"model": "laya", "state": f"ticket {i}", "questions": PIPELINE_QUESTIONS},
             )
-            return resp.status_code
+            codes.append(resp.status_code)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            codes = list(pool.map(post, range(8)))
+            list(pool.map(post, range(8)))
     assert codes == [200] * 8
     assert len(fake.seen_states) == 8
 
@@ -148,15 +150,17 @@ def test_slo_rejects_projected_late_submissions() -> None:
     with TestClient(app) as client:
         import concurrent.futures
 
-        def post(i: int) -> int:
+        codes: list[int] = []
+
+        def post(i: int) -> None:
             resp = client.post(
                 "/v1/systemone",
                 json={"model": "laya", "state": f"ticket {i}", "questions": PIPELINE_QUESTIONS},
             )
-            return resp.status_code
+            codes.append(resp.status_code)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-            codes = list(pool.map(post, range(6)))
+            list(pool.map(post, range(6)))
     # slo_ms=1 rejects everything projected past ~0ms: the whole burst is
     # refused (retryable), the endpoint never times a client out silently.
     assert set(codes) == {503}

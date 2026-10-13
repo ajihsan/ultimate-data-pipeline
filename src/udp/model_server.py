@@ -164,7 +164,7 @@ def load_checkpoint(checkpoint: str = CHECKPOINT, device: str = DEFAULT_DEVICE) 
     Returns:
         A ready-to-call agent. Import errors surface here, at startup.
     """
-    import laya  # type: ignore[import-untyped]  # (no py.typed in laya 0.4.6)
+    import laya
 
     return cast(LayaAgent, laya.load(checkpoint, device=device))
 

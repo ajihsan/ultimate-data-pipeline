@@ -12,16 +12,18 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "pydantic>=2.9",
     "faker>=30",
+    # Model server (src/udp/model_server.py) + eval (src/udp/jev_eval.py).
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
 ]
 
 # NOTE: torch / laya / transformers are intentionally NOT declared as project
 # dependencies. The pinned model runtime (torch 2.14.0+rocm10.1.0 TheRock wheels,
 # laya 0.4.6) lives in the project-local .venv installed during the S0 feasibility
-# spike; S5 wires the model server on top of it. fastapi / uvicorn / httpx are
-# likewise undeclared .venv residents (S0 bench + S5 server/eval use them). A
-# plain exact `uv sync` would strip all of these from .venv — use `make sync`
-# (uv sync --inexact). Plain `uv run` is safe by default (it syncs inexcactly;
-# only `uv run --exact` removes extras).
+# spike; S5 wires the model server on top of it. A plain exact `uv sync` would
+# strip them from .venv — use `make sync` (uv sync --inexact). Plain `uv run`
+# is safe by default (it syncs inexcactly; only `uv run --exact` removes extras).
 
 [dependency-groups]
 dev = [
@@ -45,7 +47,7 @@ packages = ["src/udp"]
 
 [tool.uv]
 # .venv intentionally also holds the S0 model runtime (torch+laya), which is not
-# part of the lockfile. See the NOTE above the [dependency-groups] table.
+# part of the lockfile. See the NOTE in [project] dependencies.
 
 [tool.ruff]
 line-length = 100
@@ -73,6 +75,12 @@ disallow_untyped_defs = true
 warn_unused_ignores = true
 check_untyped_defs = true
 warn_return_any = true
+
+[[tool.mypy.overrides]]
+# laya ships no py.typed/stubs; runners without the .venv model runtime must
+# still typecheck the server code that imports it lazily.
+module = "laya"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
