@@ -6,3 +6,4 @@ cache*
 blob*
 *.log
 .cache
+.hf-cache/
