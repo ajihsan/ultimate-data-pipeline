@@ -1,7 +1,9 @@
 """Typed domain contracts for the realtime ticket pipeline.
 
 Every payload that crosses a Kafka topic or lands in a ClickHouse row is one of
-the four models in this module, and each carries a ``schema_version`` envelope
+the four models in this module plus the mapping-added ``answers_json``
+serialization field on model_decisions (real topic payloads are therefore not
+bare-model-validatable), and each carries a ``schema_version`` envelope
 field so the wire format can evolve without silently breaking consumers.
 
 Latency measurement contract: producers set ``Ticket.ingested_at`` when the
@@ -384,7 +386,8 @@ class AlertEvent(DomainEnvelope):
         schema_version: Inherited wire schema version.
         decision_id: The originating verdict id; joins to
             ``ModelDecision.decision_id``.
-        channel: Delivery channel: ``telegram``, ``discord``, or ``mock``.
+        channel: Delivery channel: ``telegram``, ``discord``, the fan-out list
+            ``telegram,discord``, or ``mock``.
         suppressed: ``True`` when the rate limiter dropped the alert but the
             drop was still recorded.
         created_at: Producer-side moment the alert was attempted (UTC, aware).
@@ -394,7 +397,9 @@ class AlertEvent(DomainEnvelope):
         description="Originating ModelDecision.decision_id this alert belongs to.",
     )
     channel: Channel = Field(
-        description="Delivery channel: telegram, discord, or mock.",
+        description=(
+            "Delivery channel: telegram, discord, the fan-out list telegram,discord, or mock."
+        ),
     )
     suppressed: bool = Field(
         default=False,

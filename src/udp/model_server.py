@@ -13,7 +13,7 @@ Answers pass through unchanged, so decide.yaml's bloblang mappings
 keep working untouched.
 
 Concurrency: laya is single-worker (one forward pass at a time). Requests are
-admitted into a bounded queue (full → ``503`` + ``Retry-After: 0.1``, matching
+admitted into a bounded queue (full → ``503`` + ``Retry-After: 1``, matching
 decide.yaml's ``backoff_on: [429, 503]`` + 100ms ``retry_period``) and served
 by one consumer thread that coalesces queued requests into ``predict_batch``
 cohorts grouped by identical question definitions — the throughput path laya
@@ -67,7 +67,7 @@ DEFAULT_MAX_QUEUE = 64
 DEFAULT_MAX_BATCH = 8
 DEFAULT_COALESCE_MS = 10.0
 
-RETRY_AFTER_S = "0.1"  # matches decide.yaml's 100ms retry_period
+RETRY_AFTER_S = "1"  # RFC 7231 delay-seconds is an integer
 
 #: One queued inference request: ``(state, questions, future)``.
 _Job = tuple[str, dict[str, dict[str, Any]], "Future[dict[str, Any]]"]

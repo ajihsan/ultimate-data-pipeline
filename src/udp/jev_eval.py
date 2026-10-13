@@ -131,7 +131,7 @@ class EvalConfig:
 
 
 def _percentile(values: list[float], q: float) -> float:
-    """Linear-interpolated percentile of ``values`` (empty list → 0.0)."""
+    """Nearest-rank percentile of ``values`` (empty list → 0.0)."""
     if not values:
         return 0.0
     ordered = sorted(values)

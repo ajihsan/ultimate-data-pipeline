@@ -1,7 +1,9 @@
 # Domain schemas
 
 Every payload on a Kafka topic or ClickHouse row is one of the four pydantic
-models in `src/udp/schemas.py`, stamped `schema_version` (currently `1.0.0`)
+models in `src/udp/schemas.py` plus the mapping-added `answers_json`
+serialization field on model_decisions (real topic payloads are therefore not
+bare-model-validatable), stamped `schema_version` (currently `1.0.0`)
 with `extra="forbid"` — unknown fields are a producer bug. For the full
 machine-readable schema, run `python -c "from udp.schemas import Ticket;
 import json; print(json.dumps(Ticket.model_json_schema()))"` (same for the
@@ -73,6 +75,7 @@ enters the stream; deciders stamp `decided_at`. End-to-end latency is
 | `scam_probability` | float | in [0, 1] (required) |
 | `degraded` | bool | true = model endpoint failed, fallback verdict recorded (default false) |
 | `decided_at` | datetime | verdict moment, tz-aware (required) |
+| `answers_json` | str | stringified audit copy of `answers`; also the `model_decisions` CH column (mapping-added in `decide.yaml`, not a pydantic field) |
 
 `answers` on the wire — keys per question id, exactly what
 `decide.yaml` maps (`answers.escalate_now.noul`,

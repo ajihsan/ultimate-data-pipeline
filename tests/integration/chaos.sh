@@ -13,7 +13,7 @@
 #   explicit `docker compose up -d decide notify` (compose kill + up -d makes
 #   the restart deterministic instead of leaning on the restart policy) →
 #   after restart: per-table distinct ≥ produced slice, dupes ≤ +10%,
-#   caught-up (lag < 700) within 120 s AND lag == 0 within 60 s of inflow end
+#   caught-up (lag < 700) within 120 s AND drained (lag < 5) within 60 s of inflow end
 #   (renegotiated from the original lag<100/60s bar: the live-inflow
 #   committed-offset sawtooth 111–606 makes lag<100-while-inflow unreachable,
 #   and the ~40s franz session-timeout rebalance + ~40s drain put caught-up at
@@ -220,11 +220,12 @@ curve_stats() {
 }
 
 # Renegotiated criterion: caught-up (lag < 700) within 120 s of the restart,
-# AND lag == 0 within 60 s of inflow end (checked at the final drain below).
+# AND drained (lag < 5) within 60 s of inflow end (checked at the final drain below).
 # 700 sits above the live-inflow committed-offset sawtooth (~111–606, input
 # prefetch buffer) but below any real backlog, so it measures actual recovery.
 # 60 s was measured impossible twice: the franz session timeout alone parks
-# the group in rebalance ~40 s (librdkafka must evict the SIGKILLed member),
+# the group in rebalance ~40 s (franz-go — the pipelines' input library; the
+# group coordinator evicts the killed member),
 # and the ~6k replay backlog then drains ~40 s — caught-up lands at +80–81 s
 # (runs 2 and 3). 120 s = the pre-existing extension bar with ~35% headroom.
 DECIDE_CATCHUP_S=$(sample_recovery udp-decide 700 180 || true)
@@ -245,11 +246,11 @@ wait "$GEN_PID"
 GEN_END=$(date +%s)
 
 echo "--- 4/5 final drain + asserts"
-# lag == 0 within 60s of inflow end (renegotiated criterion, second half).
-DRAIN_S=$(wait_all_lags_below 5 60) || { fail "chaos:lag == 0 within 60s of inflow end" "groups never drained"; DRAIN_S=999; }
+# drained (lag < 5) within 60s of inflow end (renegotiated criterion, second half).
+DRAIN_S=$(wait_all_lags_below 5 60) || { fail "chaos:drained (lag < 5) within 60s of inflow end" "groups never drained"; DRAIN_S=999; }
 RUN_END=$(date +%s)
 if [[ "$DRAIN_S" != "999" ]]; then
-  pass "chaos:lag == 0 within 60s of inflow end" "drained in ${DRAIN_S}s"
+  pass "chaos:drained (lag < 5) within 60s of inflow end" "drained in ${DRAIN_S}s"
 fi
 echo "generator wall: $(( GEN_END - T0 ))s (kill at +$(( KILL_TS - T0 ))s, restart +$(( UP_TS - T0 ))s); final drain: ${DRAIN_S}s"
 
