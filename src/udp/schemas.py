@@ -27,8 +27,10 @@ Category = Literal["complaint", "scam_report", "billing", "bug", "access", "feat
 QuestionType = Literal["choice", "score", "noul"]
 """Question types of the ``POST /v1/systemone`` decision head (S0 contract)."""
 
-Channel = Literal["telegram", "discord", "mock"]
-"""Alert delivery channels; ``mock`` keeps demos out of real chats."""
+Channel = str
+"""Alert delivery channel as recorded in udp.alerts: ``telegram``,
+``discord``, the fan-out list ``telegram,discord``, or ``mock`` (the log-mode
+value — alerts are ClickHouse-only rows, never a validated wire payload)."""
 
 CATEGORIES: tuple[Category, ...] = (
     "complaint",
@@ -332,10 +334,22 @@ class ModelDecision(DomainEnvelope):
                     "decision_id": "4f9c2a8e7b3d4a1f8c6e2d5b0a9f7e34",
                     "question_type": "choice",
                     "answers": {
-                        "choice": "scam_report",
-                        "scores": {"escalate": 0.21, "scam": 0.78},
+                        "escalate_now": {"type": "noul", "noul": 0.91, "confidence": 0.91},
+                        "category": {
+                            "type": "choice",
+                            "choice": "scam_report",
+                            "probabilities": {
+                                "complaint": 0.02,
+                                "scam_report": 0.78,
+                                "billing": 0.03,
+                                "bug": 0.02,
+                                "access": 0.02,
+                                "feature_request": 0.13,
+                            },
+                            "confidence": 0.78,
+                        },
                     },
-                    "escalate_probability": 0.21,
+                    "escalate_probability": 0.91,
                     "scam_probability": 0.78,
                     "degraded": False,
                     "decided_at": "2026-10-13T09:12:43.640000+00:00",

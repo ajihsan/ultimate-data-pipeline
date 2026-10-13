@@ -1,10 +1,11 @@
 """Unit tests for the real model server's wire contract (fake laya agent — no GPU)."""
 
+import threading
 from typing import Any
 
 from fastapi.testclient import TestClient
 
-from udp.model_server import create_app, to_laya_questions
+from udp.model_server import InferenceGate, create_app, to_laya_questions
 
 PIPELINE_QUESTIONS: dict[str, Any] = {
     "escalate_now": {"type": "noul"},
@@ -73,6 +74,28 @@ class FakeAgent:
         return answers
 
 
+class BlockingAgent(FakeAgent):
+    """FakeAgent whose predict_batch blocks until released (queue-full tests)."""
+
+    def __init__(self) -> None:
+        """Start blocked; tests await :attr:`serving`, then call :meth:`release`."""
+        super().__init__()
+        self.serving = threading.Event()
+        self._resume = threading.Event()
+
+    def release(self) -> None:
+        """Unblock the serving loop."""
+        self._resume.set()
+
+    def predict_batch(
+        self, states: list[str], questions: dict[str, dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Block until released, then answer like FakeAgent."""
+        self.serving.set()
+        self._resume.wait(timeout=5)
+        return super().predict_batch(states, questions)
+
+
 def test_answer_shape_matches_mock() -> None:
     """The /v1/systemone response shape must equal the mock's (decide.yaml contract)."""
     fake = FakeAgent()
@@ -121,11 +144,7 @@ def test_wire_questions_are_translated_for_laya() -> None:
 def test_concurrent_requests_are_answered() -> None:
     """Concurrent posts each get their own answer (single-consumer loop)."""
     fake = FakeAgent()
-    # SLO far above the fake's zero-cost inference: this test asserts the
-    # single-consumer plumbing, not the admission policy (covered by the SLO
-    # constants' own math). Without it, an 8-deep burst's tail is correctly
-    # refused as would-be-late.
-    with TestClient(create_app(agent_factory=lambda: fake, slo_ms=10_000)) as client:
+    with TestClient(create_app(agent_factory=lambda: fake)) as client:
         import concurrent.futures
 
         codes: list[int] = []
@@ -143,27 +162,22 @@ def test_concurrent_requests_are_answered() -> None:
     assert len(fake.seen_states) == 8
 
 
-def test_slo_rejects_projected_late_submissions() -> None:
-    """Burst tails that cannot finish inside the SLO get 503 + Retry-After."""
-    fake = FakeAgent()
-    app = create_app(agent_factory=lambda: fake, max_batch=2, coalesce_ms=0, slo_ms=1)
-    with TestClient(app) as client:
-        import concurrent.futures
-
-        codes: list[int] = []
-
-        def post(i: int) -> None:
-            resp = client.post(
-                "/v1/systemone",
-                json={"model": "laya", "state": f"ticket {i}", "questions": PIPELINE_QUESTIONS},
-            )
-            codes.append(resp.status_code)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-            list(pool.map(post, range(6)))
-    # slo_ms=1 rejects everything projected past ~0ms: the whole burst is
-    # refused (retryable), the endpoint never times a client out silently.
-    assert set(codes) == {503}
+def test_full_queue_refuses_submissions() -> None:
+    """Bounded queue full → try_submit returns None (the endpoint answers 503)."""
+    fake = BlockingAgent()
+    gate = InferenceGate(fake, max_queue=1, max_batch=1, coalesce_ms=0)
+    gate.start()
+    in_flight = gate.try_submit("a", {})
+    assert in_flight is not None
+    assert fake.serving.wait(timeout=5), "consumer never picked up the request"
+    # The consumer blocks inside predict_batch, so exactly one slot stays free.
+    queued = gate.try_submit("b", {})
+    assert queued is not None
+    assert gate.try_submit("c", {}) is None  # queue full → refused
+    fake.release()
+    assert in_flight.result(timeout=5) is not None
+    assert queued.result(timeout=5) is not None
+    assert gate.try_submit("d", {}) is not None  # slot freed → admitted again
 
 
 def test_unsupported_question_type_gets_mock_parity_error() -> None:

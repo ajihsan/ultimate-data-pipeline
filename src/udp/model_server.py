@@ -1,38 +1,30 @@
 """Real Laya model server for the decide pipeline (S5).
 
-Exposes the exact ``POST /v1/systemone`` wire contract the decide pipeline's
-http processor sends (and ``tests/mocks/mock_jev.py`` implements), backed by the
-real checkpoint:
+``POST /v1/systemone`` (``{"model","state","questions":{<name>:{"type":…}}}``)
+→ ``{"answers":{…}}`` — the exact wire contract decide.yaml sends and
+``tests/mocks/mock_jev.py`` implements; ``GET /healthz`` → ``{"status": "ok"}``.
 
-    POST /v1/systemone  {"model","state","questions":{<name>:{"type":...}}}
-      → {"answers":{<name>: <answer-per-type>}}
-        noul  → {"type","noul": p(true)}                    (p of yes)
-        choice→ {"type","choice","probabilities": {...}, "confidence": ...}
-    GET  /healthz     → {"status": "ok", ...}
+laya's own ``laya.serve`` can't serve this contract (``Agent.predict``
+validation requires ``instructions`` and — for choice — ``criteria``, which
+the wire never sends), so this server accepts the wire shape, injects the
+prompts the checkpoint was trained with, and maps ``options`` → ``criteria``.
+Answers pass through unchanged, so decide.yaml's bloblang mappings
+(``answers.escalate_now.noul``, ``answers.category.probabilities.scam_report``)
+keep working untouched.
 
-laya 0.4.6 ships an HTTP surface of its own (``laya.serve``), but it forwards
-questions verbatim to ``Agent.predict``, whose validation *requires*
-``instructions`` and (for choice) ``criteria`` — the pipeline's wire contract
-sends bare ``{"type": "noul"}`` and ``{"type": "choice", "options": [...]}``.
-This server therefore sits between the two: it accepts the wire shape, injects
-the instructions/option descriptions the checkpoint was trained with, and maps
-``options`` → ``criteria``. Answers pass through unchanged, so decide.yaml's
-bloblang mappings (``answers.escalate_now.noul``,
-``answers.category.probabilities.scam_report``) keep working untouched.
-
-Concurrency discipline: laya is single-worker (one forward pass at a time).
-Requests are admitted through a bounded slot count; admission is drop-fast —
-when every slot is taken the endpoint answers ``503`` with ``Retry-After: 0.1``
-(mirroring decide.yaml's ``backoff_on: [429, 503]`` + 100 ms ``retry_period``).
-Admitted requests serialize on a :class:`threading.Lock` around
-``Agent.predict``. The slot count bounds worst-case queueing below decide's
-1500 ms endpoint timeout (8 slots × ~64 ms ≈ 512 ms).
+Concurrency: laya is single-worker (one forward pass at a time). Requests are
+admitted into a bounded queue (full → ``503`` + ``Retry-After: 0.1``, matching
+decide.yaml's ``backoff_on: [429, 503]`` + 100ms ``retry_period``) and served
+by one consumer thread that coalesces queued requests into ``predict_batch``
+cohorts grouped by identical question definitions — the throughput path laya
+exists for. Measured on this GPU (2 questions/ticket): batch 1 = 6.0
+tickets/s, batch 8 = 14.3 tickets/s at 558ms, so a full cohort stays under
+decide.yaml's 1500ms endpoint timeout — which is what lets bursty concurrent
+decide traffic finish non-degraded.
 
 The heavy runtime (torch + laya) is intentionally undeclared in pyproject and
 lives in the project-local ``.venv`` (see the pyproject NOTE); run with
 ``make model`` (``uv run python -m udp.model_server``).
-
-Standalone: ``uv run python -m udp.model_server`` (uvicorn on 127.0.0.1:8081).
 """
 
 from __future__ import annotations
@@ -56,52 +48,27 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger("udp.model_server")
 
-# Environment defaults, read before any heavy import so the model runtime finds
-# the project-local weights cache (HF_HOME=.hf-cache) and never deadlocks on a
-# TF probe (laya README: USE_TF=0).
+# Read before any heavy import: weights cache path, and no TF probe deadlock
+# (laya README: USE_TF=0).
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("HF_HOME", ".hf-cache")
 
 CHECKPOINT = "convaiinnovations/laya-typed-decisions"
-"""Hugging Face checkpoint served by default (S0-verified, 421M)."""
+DEFAULT_HOST = "127.0.0.1"  # decide reaches us via host.docker.internal
+DEFAULT_PORT = 8081  # docker-compose points MODEL_ENDPOINT_URL here
+DEFAULT_DEVICE = "cuda"  # bf16 autocast is laya's CUDA default for this checkpoint
 
-DEFAULT_HOST = "127.0.0.1"
-"""Default bind address; the decide pipeline reaches us via host.docker.internal."""
-
-DEFAULT_PORT = 8081
-"""Default bind port; docker-compose points MODEL_ENDPOINT_URL here."""
-
-DEFAULT_DEVICE = "cuda"
-"""Default torch device (S0: bf16 autocast is laya's CUDA default)."""
-
+# Queue sized so worst-case queueing stays far under decide.yaml's 1500ms
+# endpoint timeout (~8 × 64ms ≈ 512ms; the 503 backpressure keeps it bounded).
 DEFAULT_MAX_QUEUE = 64
-"""Default bounded-queue size; beyond it submissions are refused (503 + Retry-After)."""
 
+# States collated into one predict_batch call (≈573ms on this GPU); the
+# straggler wait before running a partially-filled batch.
 DEFAULT_MAX_BATCH = 8
-"""Default states collated into one predict_batch call (≈573 ms on this GPU)."""
-
 DEFAULT_COALESCE_MS = 10.0
-"""Default straggler wait before running a partially-filled batch."""
 
-DEFAULT_SLO_MS = 5000.0
-"""Admission SLO: refuse (503, retryable) requests projected past this latency.
+RETRY_AFTER_S = "0.1"  # matches decide.yaml's 100ms retry_period
 
-INERT by default: on this box the steady pipeline's concurrent bursts fit one
-batch-8 cohort (measured: 299/299 decisions non-degraded, zero refusals), and
-an active SLO converts those would-succeed requests into 503-retry gambles
-that occasionally exhaust into degraded rows. Lower it (e.g. 1480, just under
-decide.yaml's 1500 ms endpoint timeout) for workloads whose decide bursts run
-deeper than one cohort — refused requests retry with a fresh 1500 ms budget
-instead of being admitted into a guaranteed client timeout (unrecoverable →
-degraded fallback). """
-
-RETRY_AFTER_S = "0.1"
-"""Retry-After hint for 503s; matches decide.yaml's 100 ms retry_period."""
-
-#: Rough per-state forward-pass cost used for admission projections. Measured
-#: fit on this GPU (2 questions/ticket): predict_batch ≈ 30 ms + 68 ms/state.
-PER_STATE_MS = 70.0
-BATCH_BASE_MS = 30.0
 #: One queued inference request: ``(state, questions, future)``.
 _Job = tuple[str, dict[str, dict[str, Any]], "Future[dict[str, Any]]"]
 
@@ -119,8 +86,7 @@ DEFAULT_INSTRUCTIONS: Mapping[tuple[str, str], str] = {
 _NOUL_FALLBACK = "Answer yes or no for question '{qid}' based on the state."
 _CHOICE_FALLBACK = "Choose the option that best matches the state."
 
-#: Option descriptions for the pipeline's six categories (mirrors the rule-table
-#: semantics in docs/rules.md). Unknown option labels render as bare labels.
+#: Option descriptions for the pipeline's six categories (mirrors docs/rules.md).
 _CATEGORY_CRITERIA: Mapping[str, str] = {
     "complaint": "frustration or anger about the product without a concrete technical problem",
     "scam_report": "a report of phishing, scam, fraud, fake licenses, or malware",
@@ -136,7 +102,6 @@ _NOULD_CRITERIA: Mapping[str, str] = {
 }
 
 SUPPORTED_TYPES = ("choice", "score", "noul")
-"""Question types this server understands; anything else mirrors the mock's error answer."""
 
 
 class LayaAgent(Protocol):
@@ -154,16 +119,7 @@ class LayaAgent(Protocol):
 
 
 def load_checkpoint(checkpoint: str = CHECKPOINT, device: str = DEFAULT_DEVICE) -> LayaAgent:
-    """Load the Laya checkpoint once at startup.
-
-    Args:
-        checkpoint: Hugging Face model id (weights come from ``HF_HOME``).
-        device: Torch device (``cuda`` on this host; bf16 autocast is laya's
-            CUDA default for this checkpoint).
-
-    Returns:
-        A ready-to-call agent. Import errors surface here, at startup.
-    """
+    """Load the Laya checkpoint once at startup; import errors surface here."""
     import laya
 
     return cast(LayaAgent, laya.load(checkpoint, device=device))
@@ -174,17 +130,10 @@ def to_laya_questions(
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     """Translate wire questions into laya question definitions.
 
-    The wire contract carries only ``type`` (plus ``options`` for choices);
-    laya requires ``instructions`` and, for choices, ``criteria``. Known
-    question ids/option labels get domain prompts matching the pipeline's rule
-    table; unknown ones get generic fallbacks.
-
-    Args:
-        questions: Wire questions keyed by question id.
-
-    Returns:
-        ``(laya_questions, unsupported)`` — the definitions to answer, and the
-        ids that must be answered with the mock's error shape instead.
+    The wire carries only ``type`` (plus ``options`` for choices); laya needs
+    ``instructions`` and ``criteria``. Known ids/labels get domain prompts,
+    unknown ones generic fallbacks. Returns ``(laya_questions, unsupported)``
+    — the ids that must be answered with the mock's error shape instead.
     """
     laya_questions: dict[str, dict[str, Any]] = {}
     unsupported: dict[str, dict[str, Any]] = {}
@@ -217,15 +166,9 @@ def to_laya_questions(
 class InferenceGate:
     """Bounded admission + single-consumer coalescing loop around one agent.
 
-    Requests are admitted into a bounded queue (drop-fast: full → the endpoint
-    answers 503 + Retry-After) and served by ONE consumer thread — laya is
-    single-worker. The consumer coalesces whatever is queued into
-    ``predict_batch`` calls (grouped by identical question definitions), the
-    throughput path laya exists for: one forward pass per group of states
-    instead of one per state. Measured on this GPU (2 questions/ticket):
-    batch 1 = 6.0 tickets/s, batch 8 = 14.3 tickets/s at 558 ms — a full
-    cohort stays under decide.yaml's 1500 ms endpoint timeout, which is what
-    lets bursty concurrent decide traffic finish non-degraded.
+    One consumer thread (laya is single-worker) drains the queue into
+    ``predict_batch`` cohorts; ``try_submit`` is drop-fast — a full queue
+    returns ``None`` and the endpoint answers 503 + Retry-After.
     """
 
     def __init__(
@@ -234,28 +177,11 @@ class InferenceGate:
         max_queue: int,
         max_batch: int,
         coalesce_ms: float,
-        slo_ms: float = DEFAULT_SLO_MS,
     ) -> None:
-        """Bind the agent and size admission/batching.
-
-        Args:
-            agent: Loaded laya agent (single worker; all predict calls happen
-                on the consumer thread).
-            max_queue: Bounded queue size; beyond it submissions are refused
-                (the endpoint turns that into 503 + Retry-After).
-            max_batch: Max states collated into one ``predict_batch`` call.
-            coalesce_ms: How long the consumer waits for stragglers once it
-                has at least one request (0 = serve single states untouched).
-            slo_ms: Admission SLO — submissions projected to complete later
-                than this are refused (503 + Retry-After) instead of being
-                admitted to a guaranteed client timeout.
-        """
         self._agent = agent
         self._queue: queue.Queue[_Job] = queue.Queue(maxsize=max_queue)
         self._max_batch = max_batch
         self._coalesce_s = coalesce_ms / 1000.0
-        self._slo_ms = slo_ms
-        self._busy_until = 0.0  # monotonic; projected end of the running batch
         self._thread = threading.Thread(target=self._serve, daemon=True)
 
     def start(self) -> None:
@@ -265,32 +191,7 @@ class InferenceGate:
     def try_submit(
         self, state: str, questions: dict[str, dict[str, Any]]
     ) -> Future[dict[str, Any]] | None:
-        """Try to enqueue one request without blocking.
-
-        Args:
-            state: Ticket text (the wire ``state``).
-            questions: laya question definitions (from :func:`to_laya_questions`).
-
-        Returns:
-            A future resolving to the raw laya result, or ``None`` when the
-            queue is full or the projected completion misses the SLO (caller
-            answers 503 + Retry-After either way).
-        """
-        now = time.monotonic()
-        busy_ms = max(0.0, self._busy_until - now) * 1000.0
-        position = self._queue.qsize() + 1  # 1 = next to be batched
-        cohort_index = (position - 1) // self._max_batch  # 0-based cohort of mine
-        my_cohort_size = position - cohort_index * self._max_batch
-        # predict_batch serves a whole cohort in one forward pass: full cohorts
-        # ahead of mine + my own (possibly partially-filled) cohort.
-        projected_ms = (
-            busy_ms
-            + cohort_index * (BATCH_BASE_MS + self._max_batch * PER_STATE_MS)
-            + BATCH_BASE_MS
-            + my_cohort_size * PER_STATE_MS
-        )
-        if projected_ms > self._slo_ms:
-            return None
+        """Enqueue one request without blocking; ``None`` = queue full (→ 503)."""
         future: Future[dict[str, Any]] = Future()
         try:
             self._queue.put_nowait((state, questions, future))
@@ -314,22 +215,12 @@ class InferenceGate:
                     break
             groups: dict[str, list[_Job]] = {}
             for job in batch:
-                key = json.dumps(job[1], sort_keys=True)
-                groups.setdefault(key, []).append(job)
-            self._busy_until = (
-                time.monotonic() + (len(batch) * PER_STATE_MS + BATCH_BASE_MS) / 1000.0
-            )
+                groups.setdefault(json.dumps(job[1], sort_keys=True), []).append(job)
             for items in groups.values():
                 self._predict_group(items)
 
     def _predict_group(self, items: list[_Job]) -> None:
-        """Run one ``predict_batch`` over a same-questions group.
-
-        Args:
-            items: ``(state, questions, future)`` jobs sharing one question
-                definition; every future is settled (result or exception),
-                cancelled ones are skipped.
-        """
+        """Run one ``predict_batch`` over a same-questions group; settle futures."""
         try:
             results = self._agent.predict_batch([state for state, _, _ in items], items[0][1])
             for (_, _, future), result in zip(items, results, strict=True):
@@ -356,8 +247,7 @@ class SystemOneRequest(BaseModel):
     """The ``POST /v1/systemone`` request the decide pipeline sends.
 
     Deliberately NOT the domain envelope (schemas.py): the wire contract is
-    Jev's ``/v1/systemone``, and this module keeps its own dependency-light
-    models so decide.yaml's http processor spec stays untouched.
+    Jev's ``/v1/systemone``, and this module keeps dependency-light models.
     """
 
     model: str | None = Field(default=None, description="Requested checkpoint id (informational).")
@@ -370,10 +260,9 @@ class SystemOneRequest(BaseModel):
 def warmup(agent: LayaAgent) -> None:
     """Pre-fire the CUDA path with the pipeline's exact question shape.
 
-    Without this, the first real request pays lazy kernel initialization
-    (seconds) and blows decide.yaml's 1500 ms endpoint timeout — the first
-    flagged tickets would all land in the degraded fallback. Three passes
-    also let the CUDA memory pool reach its steady footprint before serving.
+    The first real request would otherwise pay lazy kernel initialization
+    (seconds) and blow decide's 1500ms timeout; three passes also let the CUDA
+    memory pool reach its steady footprint before serving.
     """
     questions, _ = to_laya_questions(
         {
@@ -401,22 +290,11 @@ def create_app(
     max_queue: int = DEFAULT_MAX_QUEUE,
     max_batch: int = DEFAULT_MAX_BATCH,
     coalesce_ms: float = DEFAULT_COALESCE_MS,
-    slo_ms: float = DEFAULT_SLO_MS,
 ) -> FastAPI:
     """Build the FastAPI app, loading the checkpoint once at startup.
 
-    Args:
-        agent_factory: Optional zero-arg callable producing the agent
-            (dependency injection for tests; defaults to
-            :func:`load_checkpoint` with the real CUDA checkpoint — including
-            the startup warmup; injected fakes skip it).
-        max_queue: Bounded queue size (queue-full answers 503 + Retry-After).
-        max_batch: Max states collated into one ``predict_batch`` call.
-        coalesce_ms: Straggler wait before running a partially-filled batch.
-        slo_ms: Admission SLO — projected-slower submissions get 503 + Retry-After.
-
-    Returns:
-        The configured app. uvicorn serves it via :func:`main`.
+    ``agent_factory`` is dependency injection for tests (defaults to
+    :func:`load_checkpoint` + the startup warmup; injected fakes skip warmup).
     """
     gate: InferenceGate | None = None
 
@@ -426,15 +304,14 @@ def create_app(
         agent = agent_factory() if agent_factory is not None else load_checkpoint()
         if agent_factory is None:
             warmup(agent)
-        gate = InferenceGate(agent, max_queue, max_batch, coalesce_ms, slo_ms)
+        gate = InferenceGate(agent, max_queue, max_batch, coalesce_ms)
         gate.start()
         logger.info(
-            "model server ready: %s queue=%d batch=%d coalesce=%.0fms slo=%.0fms",
+            "model server ready: %s queue=%d batch=%d coalesce=%.0fms",
             CHECKPOINT,
             max_queue,
             max_batch,
             coalesce_ms,
-            slo_ms,
         )
         yield
         gate = None
@@ -450,19 +327,9 @@ def create_app(
     async def systemone(req: SystemOneRequest) -> JSONResponse | dict[str, Any]:
         """Answer the wire questions with real laya answers (mock's shape).
 
-        Args:
-            req: The decide pipeline's request (model/state/questions).
-
-        Returns:
-            ``{"answers": {...}}`` exactly as the mock does (unsupported
-            question types get per-id error answers, mock parity), with a
-            ``Server-Timing: inference;dur=`` header covering queue wait +
-            batched forward pass, for latency attribution.
-
-        Raises:
-            HTTPException: 503 + ``Retry-After`` when the admission queue is
-                full; 500 on inference failure (decide records a degraded
-                fallback either way).
+        503 + ``Retry-After`` when the admission queue is full (decide retries
+        with backoff); 500 on inference failure. ``Server-Timing:
+        inference;dur=`` covers queue wait + batched forward pass.
         """
         assert gate is not None, "gate must be built by the lifespan"
         wire_questions = {qid: q.model_dump() for qid, q in req.questions.items()}
@@ -499,14 +366,13 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
     # The consumer thread's per-batch decode work (numpy answer shaping between
     # torch ops) holds the GIL in long stretches; without a tighter switch
-    # interval the uvicorn event loop can stall long enough for decide's 1500 ms
-    # client timeout to fire on connections that are still unaccepted.
+    # interval the uvicorn event loop can stall long enough for decide's
+    # 1500ms client timeout to fire on connections that are still unaccepted.
     sys.setswitchinterval(0.0005)
     uvicorn.run(
         create_app(
             max_batch=int(os.environ.get("MODEL_MAX_BATCH", str(DEFAULT_MAX_BATCH))),
             coalesce_ms=float(os.environ.get("MODEL_COALESCE_MS", str(DEFAULT_COALESCE_MS))),
-            slo_ms=float(os.environ.get("MODEL_SLO_MS", str(DEFAULT_SLO_MS))),
         ),
         host=os.environ.get("MODEL_HOST", DEFAULT_HOST),
         port=int(os.environ.get("MODEL_PORT", str(DEFAULT_PORT))),

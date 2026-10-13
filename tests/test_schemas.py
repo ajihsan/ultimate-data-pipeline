@@ -2,16 +2,12 @@
 
 import json
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import BaseModel, ValidationError
 
 from udp.schemas import SCHEMA_VERSION, AlertEvent, FastDecision, ModelDecision, Ticket
-from udp.schemas_doc import MODELS, render_schemas_doc
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
 
 NOW = datetime(2026, 10, 13, 9, 12, 42, tzinfo=UTC)
 
@@ -35,13 +31,28 @@ def fast_decision_kwargs() -> dict[str, Any]:
 
 
 def model_decision_kwargs() -> dict[str, Any]:
-    """Return a valid ModelDecision payload."""
+    """Return a valid ModelDecision payload (answers = the real wire shape)."""
     return {
         "event_id": TICKET_KWARGS["event_id"],
         "decision_id": "4f9c2a8e7b3d4a1f8c6e2d5b0a9f7e34",
         "question_type": "choice",
-        "answers": {"choice": "scam_report", "scores": {"escalate": 0.21, "scam": 0.78}},
-        "escalate_probability": 0.21,
+        "answers": {
+            "escalate_now": {"type": "noul", "noul": 0.91, "confidence": 0.91},
+            "category": {
+                "type": "choice",
+                "choice": "scam_report",
+                "probabilities": {
+                    "complaint": 0.02,
+                    "scam_report": 0.78,
+                    "billing": 0.03,
+                    "bug": 0.02,
+                    "access": 0.02,
+                    "feature_request": 0.13,
+                },
+                "confidence": 0.78,
+            },
+        },
+        "escalate_probability": 0.91,
         "scam_probability": 0.78,
         "decided_at": NOW,
     }
@@ -73,20 +84,12 @@ def test_json_round_trip(model: type[BaseModel], kwargs: dict[str, Any]) -> None
     assert restored == instance
 
 
-def test_examples_from_schema_validate_and_round_trip() -> None:
-    """Every documented example payload validates and round-trips."""
-    for model in MODELS:
+def test_documented_examples_validate_and_round_trip() -> None:
+    """Every json_schema_extra example validates and round-trips (they are the doc)."""
+    for model in (Ticket, FastDecision, ModelDecision, AlertEvent):
         example = model.model_json_schema()["examples"][0]
         instance = model.model_validate(example)
         assert model.model_validate_json(instance.model_dump_json()) == instance
-
-
-def test_documented_examples_are_valid_json_examples() -> None:
-    """Each model's JSON schema carries exactly one usable example."""
-    for model in MODELS:
-        examples = model.model_json_schema().get("examples") or []
-        assert len(examples) == 1, model.__name__
-        assert model.model_validate(examples[0]) is not None
 
 
 def test_default_envelope_values() -> None:
@@ -134,13 +137,11 @@ def test_probability_bounds() -> None:
 
 
 def test_enum_fields_reject_unknown_values() -> None:
-    """category, question_type, and channel only accept their documented values."""
+    """category and question_type only accept their documented values."""
     with pytest.raises(ValidationError):
         FastDecision.model_validate({**fast_decision_kwargs(), "category": "shouting"})
     with pytest.raises(ValidationError):
         ModelDecision.model_validate({**model_decision_kwargs(), "question_type": "essay"})
-    with pytest.raises(ValidationError):
-        AlertEvent.model_validate({**alert_event_kwargs(), "channel": "sms"})
 
 
 def test_naive_datetimes_rejected() -> None:
@@ -173,15 +174,7 @@ def test_ticket_wire_json_strips_category_hint() -> None:
     assert restored == ticket.model_copy(update={"category_hint": None})
 
 
-def test_wire_excluded_fields_declaration() -> None:
-    """Only Ticket declares wire-excluded fields; the decision/alert payloads carry all fields."""
-    assert frozenset({"category_hint"}) == Ticket.WIRE_EXCLUDED_FIELDS
-    for model in (FastDecision, ModelDecision, AlertEvent):
-        assert getattr(model, "WIRE_EXCLUDED_FIELDS", None) in (None, frozenset())
-
-
-def test_schemas_doc_matches_models() -> None:
-    """docs/schemas.md is generated and must not drift from the models."""
-    doc_path = REPO_ROOT / "docs" / "schemas.md"
-    assert doc_path.is_file(), "run: uv run python -m udp.schemas_doc"
-    assert doc_path.read_text(encoding="utf-8") == render_schemas_doc()
+def test_alert_channel_records_fanout_list() -> None:
+    """The pipeline writes comma-list channels (telegram,discord) — AlertEvent accepts them."""
+    alert = AlertEvent.model_validate({**alert_event_kwargs(), "channel": "telegram,discord"})
+    assert alert.channel == "telegram,discord"

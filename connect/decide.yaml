@@ -2,7 +2,7 @@
 #
 # FAST-PATH RULE TABLE — deterministic FIRST-MATCH priority, evaluated in the
 # order below on the lowercased ticket text (substring match). docs/rules.md
-# is the human-readable copy; tests/test_rules_doc.py asserts this block.
+# is the human-readable copy.
 #   rule 1: scam_report     conf 0.95 keywords: scam, fraud, phishing, fake, "charged twice", malware
 #   rule 2: billing         conf 0.90 keywords: invoice, charged, refund, subscription, declined, renewal, billing
 #   rule 3: bug             conf 0.90 keywords: crash, error, broken, "white screen", fail, stale, unreadable, duplicate, truncat, "null pointer"
@@ -15,24 +15,14 @@
 # Confident verdicts (rules 1-6) build a FastDecision and fan out to
 # udp.fast_decisions + topic `fast_decisions`; the model is never touched.
 # Flagged verdicts (rules 7-8) POST the /v1/systemone contract to
-# MODEL_ENDPOINT_URL (1500ms timeout, 1 retry, backoff on 429/503). EVERY
-# flagged event yields a ModelDecision row: the endpoint's answers on success,
-# or a degraded fallback (escalate/scam = 0, degraded = true) on failure —
-# counted in the `model_degraded_total` Prometheus counter.
+# MODEL_ENDPOINT_URL. EVERY flagged event yields a ModelDecision row: the
+# endpoint's answers on success, or a degraded fallback (escalate/scam = 0,
+# degraded = true) on failure — counted in `model_degraded_total`.
+#
+# S5b concurrency (measured; math at each knob): threads 4, checkpoint_limit
+# 1024, http timeout 1500ms.
 #
 # Health: GET :4195/ping; metrics: :4195/metrics.
-#
-# S5b CONCURRENCY TUNING (decided by measurement; math at each knob):
-#   threads 4          — concurrent model calls cap at 4 → model-server
-#                        cohorts ≤ 4 states → worst in-load service ≈ 310ms
-#                        (30ms base + 4 × 70ms/state) ≪ the 1500ms timeout.
-#   checkpoint_limit 1024 — pending includes rows parked in the output batcher
-#                        (sql_insert: 100 rows / 1s → pending peaks ~100-150);
-#                        limit 1 parked the poll loop on those ACK waves →
-#                        ~1s delivery bursts → fast-path p95 ≈ 2s at 100 ev/s.
-#   http timeout 1500ms — ≈ 4.8× the worst cohort-4 service; a timeout is
-#                        unrecoverable (retries fire only on 429/503), so
-#                        headroom beats tightness.
 
 http:
   address: 0.0.0.0:4195
@@ -45,37 +35,28 @@ input:
       - tickets
     consumer_group: udp-decide
     start_from_oldest: true
-    # S5b: the franz input delivers the WHOLE fetched chunk, then pauses the
-    # partition until pending (delivered, un-ACKed) drops below
-    # checkpoint_limit. Pending includes rows parked in the OUTPUT batcher —
-    # sql_insert batches flush at 100 rows / 1s, so pending sawtooths to
-    # ~100-150 at 100 ev/s — and ACKs land in those flush waves. The old
-    # limit 1 parked polling on every wave → ~1s delivery bursts → fast-path
-    # p95 ≈ 2s at 100 ev/s (a message sat out a full ACK wave). 1024 ≫ the
-    # pending peak keeps the partition unpaused at up to ~10× the publish
-    # rate; on crash it still bounds redelivery to ~10s of steady traffic.
-    # (franz_reader_unordered.go, redpanda-connect v4.113.)
+    # Pending includes rows parked in the OUTPUT batcher (sql_insert flushes
+    # 100 rows / 1s → pending sawtooths to ~100-150 at 100 ev/s). The old
+    # limit 1 parked the franz poll loop on every ACK wave → ~1s delivery
+    # bursts → fast-path p95 ≈ 2s. 1024 ≫ the pending peak keeps the
+    # partition unpaused; on crash it still bounds redelivery to ~10s.
     checkpoint_limit: 1024
 
 pipeline:
-  # S5b: 4 workers cap concurrent model HTTP calls at 4 → the model server's
-  # predict_batch cohorts stay ≤ 4 states → worst in-load service ≈ 310ms
-  # (30ms base + 4 × 70ms/state, S5-measured on this GPU) — well inside the
-  # 1500ms endpoint timeout, so bursts no longer time out into degraded rows
-  # (S5: the 12-thread NumCPU default fired 12-30 concurrent calls → cohort
-  # + queue overran 750ms → 167/348 burst flags degraded). Throughput headroom:
-  # steady mix (95% fast @ ~2ms + 5% model @ ≤310ms) ≈ 230-360 msg/s vs 100
-  # ev/s; demo burst (98% fast + 2% capped flags) ≈ 490 msg/s vs 300 ev/s.
+  # 4 workers cap concurrent model calls at 4 → server cohorts ≤ 4 states →
+  # worst in-load service ≈ 310ms (30ms base + 4 × 70ms/state, S5-measured) —
+  # inside the 1500ms timeout. The 12-thread default fired 12-30 concurrent
+  # calls → 167/348 burst flags degraded.
   threads: 4
   processors:
     # Classify (rule table above). Tickets with no usable event_id/text are
-    # marked null-flagged: they match no case and drop (ingest already DLQ'd
-    # a copy). Unparseable tickets are normalized the same way by the catch.
+    # null-flagged: they match no output case and drop (ingest already DLQ'd
+    # a copy); the catch normalizes unparseable tickets the same way.
     - try:
         - mapping: |
             # The kafka_franz input auto-parses JSON, so `this` is the parsed
-            # ticket already. Field access on unparseable bytes errors below
-            # (caught by the catch, which normalizes to a dropped record).
+            # ticket already; field access on unparseable bytes errors and is
+            # caught below.
             root = this
             let eid = root.event_id | ""
             let text = root.text | ""
@@ -160,13 +141,9 @@ pipeline:
                     verb: POST
                     headers:
                       Content-Type: application/json
-                    # S5b: 1500ms ≈ 4.8× the worst cohort-4 service (310ms) and
-                    # also covers a batch-8 cohort (558ms) if a host-side eval
-                    # ever overlaps the GPU. Every timeout is unrecoverable —
-                    # retries fire only on 429/503; a timeout lands straight in
-                    # the degraded fallback below — so headroom beats
-                    # tightness. Only the tail uses it; the steady model-path
-                    # p95 target (≤500ms) is met far inside the old budget.
+                    # ≈4.8× the worst cohort-4 service; timeouts are
+                    # unrecoverable (retries fire only on 429/503) so headroom
+                    # beats tightness.
                     timeout: 1500ms
                     retries: 1
                     backoff_on:

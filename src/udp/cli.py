@@ -17,10 +17,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"udp {__version__}")
     subparsers = parser.add_subparsers(dest="command", metavar="command")
     subparsers.add_parser(
-        "ingest",
-        help="run the ingest → decide → store loop (wired in S2)",
-    )
-    subparsers.add_parser(
         "generate",
         parents=[build_generate_parser(add_help=False)],
         description="Generate synthetic app-user tickets onto Kafka.",
@@ -30,20 +26,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Entry point for the ``udp`` console script.
-
-    Args:
-        argv: CLI arguments (defaults to ``sys.argv[1:]``).
-
-    Returns:
-        Process exit code.
-    """
+    """Entry point for the ``udp`` console script."""
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "generate":
         return run_from_namespace(args)
-    if args.command == "ingest":
-        print("udp ingest is wired in S2 (schema + generator)")
-        return 0
     parser.print_help()
     return 0

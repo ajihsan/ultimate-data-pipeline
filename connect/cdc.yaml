@@ -1,30 +1,19 @@
 # S7 — cdc pipeline: topic `pg_changes` (conduit's OpenCDC records) →
 # ClickHouse `udp.app_users_cdc`.
 #
-# - kafka_franz input with consumer group `udp-cdc`: committed offsets make
-#   restarts resume where they left off; an offset reset replays the topic and
-#   re-lands rows (at-least-once) — udp.app_users_cdc is a MergeTree append
-#   log and CURRENT STATE is deduped at read time (argMax per id keyed on the
-#   kafka offset, latest op wins, op='d' ids excluded — see clickhouse/cdc.sql),
-#   so replays are safe.
-# - Input records are conduit's default opencdc/json:
-#   {"position": <b64 json>, "operation": "snapshot|create|update|delete",
-#    "metadata": {...}, "key": {"id": N}, "payload": {"before", "after"}}.
-#   - position is base64 JSON like {"type":"CDC","last_lsn":"0/E38498"} (CDC)
-#     or {"type":"Snapshot",...}; it is decoded to a traceable string.
-#   - op is folded to short codes: snapshot|c|u|d.
-#   - the kafka offset is landed too: it is the changelog's stable total order
-#     (single-partition topic), preserved verbatim across replays — unlike
-#     landed_at, which a replay re-stamps with fresh timestamps.
-#   - DELETE events carry only the key under postgres' default replica
-#     identity, so tombstone rows (op='d') land with empty strings and NULL
-#     timestamps — readers MUST drop ids whose latest op is 'd' for current
-#     state.
-# - Rows land via sql_insert (clickhouse driver, DSN from CLICKHOUSE_DSN),
-#   batched 100 rows / 1s like ingest (keeps wall-clock CDC latency ≈1s).
+# Committed offsets resume restarts; an offset reset replays and re-lands
+# rows (at-least-once) — CURRENT STATE is a read-time contract: argMax per id
+# keyed on the kafka offset (the changelog's stable total order, preserved
+# across replays — unlike landed_at, which a replay re-stamps), ids whose
+# latest op is 'd' dropped (see clickhouse/cdc.sql for the full rationale).
 #
-# Metrics: Prometheus on :4195/metrics (input_received / output_sent counters).
-# Health:  GET :4195/ping (compose healthcheck).
+# Input records are conduit's default opencdc/json:
+#   {"position": <b64 json>, "operation": "snapshot|create|update|delete",
+#    "metadata": {...}, "key": {"id": N}, "payload": {"before", "after"}}
+# DELETE events carry only the key (default replica identity) → tombstone
+# rows (op='d') land with empty strings and NULL timestamps.
+#
+# Metrics: Prometheus on :4195/metrics. Health: GET :4195/ping.
 
 http:
   address: 0.0.0.0:4195
@@ -66,11 +55,10 @@ pipeline:
             _ => "snapshot",
           },
           # Decoded OpenCDC position JSON (type + last_lsn) — the replication
-          # trace of the row (no hex LSN math in bloblang; the string carries it).
+          # trace of the row.
           "position": this.position.decode("base64"),
-          # Kafka offset of the changelog event — stable across replays (unlike
-          # landed_at), so it is the read-time dedupe key's authority.
-          # (Metadata values are strings; number() → int64 for the UInt64 column.)
+          # Kafka offset — the read-time dedupe key's authority (stable across
+          # replays, unlike landed_at). number() → int64 for the UInt64 column.
           "offset": meta("kafka_offset").number(),
         }
 

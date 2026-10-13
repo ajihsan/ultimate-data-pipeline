@@ -29,9 +29,8 @@ input:
 
 pipeline:
   processors:
-    # The kafka_franz input lazily auto-parses JSON content, so `this` is the
-    # parsed Ticket already; field access on unparseable bytes errors here and
-    # is stamped + cleared below so the switch can DLQ it with raw payload.
+    # The kafka_franz input lazily auto-parses JSON, so `this` is the parsed
+    # Ticket already; errors are caught below so the switch can DLQ raw.
     - try:
         - mapping: 'root = this'
     - catch:

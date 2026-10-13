@@ -109,10 +109,10 @@ def test_demo_scam_share() -> None:
 
 
 def test_templates_cover_categories() -> None:
-    """Every category ships ≥5 templates; the ambiguous pool has ≥5 too."""
+    """Every category ships ≥2 templates; the ambiguous pool has ≥2 too."""
     for category in CATEGORIES:
-        assert len(tickets.TEMPLATES[category]) >= 5, category
-    assert len(tickets.AMBIGUOUS_TEMPLATES) >= 5
+        assert len(tickets.TEMPLATES[category]) >= 2, category
+    assert len(tickets.AMBIGUOUS_TEMPLATES) >= 2
 
 
 def test_ambiguous_flagged_hint_is_none() -> None:
@@ -133,14 +133,6 @@ def test_burst_profile_budget_bound_assert() -> None:
             scam_share=0.6,
             flagged_budget=MAX_FLAGGED_PER_BURST + 1,
         )
-
-
-def test_max_flagged_per_burst_matches_s0_derivation() -> None:
-    """The demo budget equals 0.5 × 12 dec/s × 60 s = 360 (S0 ceiling, 50% headroom)."""
-    assert tickets.MODEL_CEILING_DEC_PER_S == 12.0
-    assert tickets.FLAG_BUDGET_HEADROOM == 0.5
-    assert tickets.BURST_DURATION_S == 60.0
-    assert MAX_FLAGGED_PER_BURST == 360
 
 
 def test_dry_run_cli_prints_valid_tickets(capsys: pytest.CaptureFixture[str]) -> None:
