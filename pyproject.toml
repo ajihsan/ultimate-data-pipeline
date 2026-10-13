@@ -26,6 +26,7 @@ dev = [
 
 [project.scripts]
 udp = "udp.cli:main"
+udp-generate = "udp.generator.tickets:main"
 
 [build-system]
 requires = ["hatchling"]
