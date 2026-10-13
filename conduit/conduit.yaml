@@ -1,0 +1,53 @@
+# S7 — conduit bus CDC pipeline: Postgres `app_users` → Redpanda `pg_changes`.
+#
+# Source: builtin postgres connector (bundled in conduit v0.20.0), snapshot
+# first (snapshotMode: initial) then logical-replication CDC
+# (cdcMode: logrepl). The slot/publication pair is the resume point: conduit
+# re-attaches to `conduitslot` after a restart (checkpoint lives in the
+# conduit-data badger volume), so snapshots never re-run. Postgres runs with
+# wal_level=logical (see the postgres command in docker-compose.yaml); the
+# connector creates the publication + slot on first boot and deletes them only
+# when the connector/pipeline is removed (logrepl.autoCleanup default true).
+#
+# Destination: builtin kafka connector → topic `pg_changes` (created by the
+# redpanda-init bootstrap). Records keep conduit's default opencdc/json
+# format: {"position","operation","metadata","key","payload":{"before","after"}}.
+# The connect `cdc` pipeline (docker-compose.yaml service `cdc`) lands these
+# into ClickHouse udp.app_users_cdc.
+#
+# Field names verified against the v0.20.0 docs (llms-full.txt, postgres
+# v0.14.2 / kafka v0.12.5) and empirically on the running stack, 2026-10-13.
+
+version: 2.2
+pipelines:
+  - id: pg-cdc
+    status: running
+    description: postgres app_users snapshot + WAL CDC → kafka topic pg_changes
+    connectors:
+      - id: pg-src
+        type: source
+        plugin: builtin:postgres
+        settings:
+          # Dev DSN = compose defaults (POSTGRES_* in .env); conduit pipeline
+          # configs do not do env expansion (no such feature documented as of
+          # v0.20.0), so this is literal. udp is the bootstrap superuser, which
+          # owns REPLICATION rights for the slot.
+          url: postgres://udp:udp-dev-password@postgres:5432/udp?sslmode=disable
+          tables: app_users
+          cdcMode: logrepl
+          snapshotMode: initial
+          logrepl.publicationName: conduitpub
+          logrepl.slotName: conduitslot
+          # The default (true) attaches an avro schema to every record; DELETE
+          # records then fail to encode — the partial before-payload ({id} only,
+          # default replica identity) can't marshal against the full-table
+          # schema ("created_at: *avro.null is unsupported for Avro long") and
+          # the pipeline degrades. We consume plain OpenCDC structured data, so
+          # schemas are off (verified 2026-10-13 on v0.20.0 / pg source v0.14.2).
+          logrepl.withAvroSchema: false
+      - id: kafka-dst
+        type: destination
+        plugin: builtin:kafka
+        settings:
+          servers: redpanda:29092
+          topic: pg_changes

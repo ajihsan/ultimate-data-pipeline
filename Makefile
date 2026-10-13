@@ -2,7 +2,7 @@
 # Plain `uv sync` exact-syncs .venv and would remove the S0 model runtime
 # (TheRock torch wheels + laya); `make sync` runs --inexact to preserve it.
 
-.PHONY: sync lint fmt typecheck test hooks model model-container up up-model up-mock down down-v logs demo load-test
+.PHONY: sync lint fmt typecheck test hooks model model-container up up-model up-mock down down-v logs demo load-test mutate
 
 sync:
 	uv sync --inexact
@@ -56,3 +56,8 @@ demo:
 
 load-test:
 	@echo "wired in S8 (synthetic load test)"
+
+# S7 — deterministic app_users mutations through the conduit bus CDC path
+# (postgres → pg_changes → app_users_cdc); prints each op for correlation.
+mutate:
+	uv run udp-pg-mutate --mode mix --count 10

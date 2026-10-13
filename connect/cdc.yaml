@@ -1,0 +1,111 @@
+# S7 — cdc pipeline: topic `pg_changes` (conduit's OpenCDC records) →
+# ClickHouse `udp.app_users_cdc`.
+#
+# - kafka_franz input with consumer group `udp-cdc`: committed offsets make
+#   restarts resume where they left off; an offset reset replays the topic and
+#   re-lands rows (at-least-once) — udp.app_users_cdc is a MergeTree append
+#   log and CURRENT STATE is deduped at read time (argMax per id keyed on the
+#   kafka offset, latest op wins, op='d' ids excluded — see clickhouse/cdc.sql),
+#   so replays are safe.
+# - Input records are conduit's default opencdc/json:
+#   {"position": <b64 json>, "operation": "snapshot|create|update|delete",
+#    "metadata": {...}, "key": {"id": N}, "payload": {"before", "after"}}.
+#   - position is base64 JSON like {"type":"CDC","last_lsn":"0/E38498"} (CDC)
+#     or {"type":"Snapshot",...}; it is decoded to a traceable string.
+#   - op is folded to short codes: snapshot|c|u|d.
+#   - the kafka offset is landed too: it is the changelog's stable total order
+#     (single-partition topic), preserved verbatim across replays — unlike
+#     landed_at, which a replay re-stamps with fresh timestamps.
+#   - DELETE events carry only the key under postgres' default replica
+#     identity, so tombstone rows (op='d') land with empty strings and NULL
+#     timestamps — readers MUST drop ids whose latest op is 'd' for current
+#     state.
+# - Rows land via sql_insert (clickhouse driver, DSN from CLICKHOUSE_DSN),
+#   batched 100 rows / 1s like ingest (keeps wall-clock CDC latency ≈1s).
+#
+# Metrics: Prometheus on :4195/metrics (input_received / output_sent counters).
+# Health:  GET :4195/ping (compose healthcheck).
+
+http:
+  address: 0.0.0.0:4195
+
+input:
+  kafka_franz:
+    seed_brokers:
+      - redpanda:29092
+    topics:
+      - pg_changes
+    consumer_group: udp-cdc
+    start_from_oldest: true
+
+pipeline:
+  processors:
+    - mapping: |
+        # OpenCDC record → one flat row. after wins over before over key:
+        # snapshot/create/update carry the full row in payload.after; a delete
+        # carries the old tuple in payload.before (key columns only) with
+        # after=null.
+        let row = this.payload.after | this.payload.before | this.key
+        root = {
+          "id": ($row.id | this.key.id).number(),
+          "email": $row.email | "",
+          "plan": $row.plan | "",
+          "status": $row.status | "",
+          "created_at": match {
+            $row.created_at != null => $row.created_at.ts_format("2006-01-02 15:04:05.999", "UTC"),
+            _ => null,
+          },
+          "updated_at": match {
+            $row.updated_at != null => $row.updated_at.ts_format("2006-01-02 15:04:05.999", "UTC"),
+            _ => null,
+          },
+          "op": match {
+            this.operation == "create" => "c",
+            this.operation == "update" => "u",
+            this.operation == "delete" => "d",
+            _ => "snapshot",
+          },
+          # Decoded OpenCDC position JSON (type + last_lsn) — the replication
+          # trace of the row (no hex LSN math in bloblang; the string carries it).
+          "position": this.position.decode("base64"),
+          # Kafka offset of the changelog event — stable across replays (unlike
+          # landed_at), so it is the read-time dedupe key's authority.
+          # (Metadata values are strings; number() → int64 for the UInt64 column.)
+          "offset": meta("kafka_offset").number(),
+        }
+
+output:
+  # DateTime64(3) columns take the normalized "2006-01-02 15:04:05.999" form;
+  # null timestamps only occur on op='d' tombstones (Nullable in cdc.sql).
+  sql_insert:
+    driver: clickhouse
+    dsn: ${CLICKHOUSE_DSN}
+    table: app_users_cdc
+    columns:
+      - id
+      - email
+      - plan
+      - status
+      - created_at
+      - updated_at
+      - op
+      - position
+      - offset
+    args_mapping: |
+      root = [
+        this.id,
+        this.email,
+        this.plan,
+        this.status,
+        this.created_at,
+        this.updated_at,
+        this.op,
+        this.position,
+        this.offset,
+      ]
+    batching:
+      count: 100
+      period: 1s
+
+metrics:
+  prometheus: {}

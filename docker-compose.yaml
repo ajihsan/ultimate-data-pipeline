@@ -1,5 +1,5 @@
 # S3 infra + S4 connect pipelines + S5 model server (profile `model`) +
-# S6 notify pipeline. Conduit (S7) is appended by its own subtask.
+# S6 notify pipeline + S7 conduit bus CDC (postgres → pg_changes → app_users_cdc).
 # Default stack: `make up` (no model). Real-model stack: `make up-model`.
 #
 # Pinned images (linux/amd64, verified 2026-10-13):
@@ -8,6 +8,14 @@
 #   postgres:16-alpine                        sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
 #   redpandadata/console:v3.12.0              sha256:9dc0cd55db172c6be9c2ff8a51f33a14395f7675fa7fbc002c277f3b96115c27
 #   redpandadata/connect:4.113.0              sha256:1bdf3246c32985dfef0e4a82e6866f082887a095f9e0e5b778dbe38add70c5d8
+#   ghcr.io/conduitio/conduit:v0.20.0         sha256:e674b7f07d5a0eae98df99521ea81c3b6218ef3e50d724e22797f82e4b778c9a
+#
+# NOTE: conduitio/conduit NO LONGER EXISTS on Docker Hub (404, 2026-10-13) —
+# images are distributed on GitHub Container Registry (ghcr.io/conduitio/conduit,
+# see https://conduitdata.io/docs/installing-and-running). v0.20.0 is the first
+# stable release with the SEV-0 Postgres snapshot→CDC stall fixed (present in
+# v0.19.0); it ships builtin postgres + kafka connectors, and /healthz lives on
+# the HTTP API port 8080 (8084 is the gRPC API).
 #
 # Kafka listener layout (single-node dev):
 #   PLAINTEXT 29092 — intra-compose clients (console, S4 connect, S7 conduit)
@@ -20,7 +28,8 @@
 #
 # Every host port is bound to 127.0.0.1 — this is a shared homelab; nothing here
 # is reachable from the LAN. Memory caps: redpanda 1.5G, clickhouse 3G (with a
-# 2.5G server-side ceiling), postgres 256m, console 200m, connect 250m each.
+# 2.5G server-side ceiling), postgres 256m, console 200m, connect 250m each,
+# conduit 250m.
 # Connect metrics are republished on the host as 4196 (ingest) / 4197 (decide).
 
 name: udp
@@ -74,6 +83,7 @@ services:
         ensure fast_decisions
         ensure model_decisions
         ensure tickets_dlq
+        ensure pg_changes # S7 — conduit bus CDC changelog
         rpk -X brokers=redpanda:29092 topic list
     networks:
       - udp-net
@@ -97,6 +107,7 @@ services:
     volumes:
       - clickhouse-data:/var/lib/clickhouse
       - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./clickhouse/cdc.sql:/docker-entrypoint-initdb.d/cdc.sql:ro # S7 cdc mirror
     mem_limit: 3g
     networks:
       - udp-net
@@ -109,6 +120,10 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    # S7 — Conduit's postgres source runs in logrepl CDC mode, which needs
+    # logical decoding: SHOW wal_level must return `logical` (default is
+    # `replica`). Verified 2026-10-13.
+    command: ["postgres", "-c", "wal_level=logical"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-udp}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-udp-dev-password}
@@ -295,6 +310,76 @@ services:
       retries: 6
       start_period: 15s
 
+  # S7 — conduit bus CDC: Postgres snapshot + WAL (logical replication) →
+  # topic `pg_changes` (OpenCDC json records: payload.before/after, op).
+  # Checkpoints (source position incl. replication slot) persist in the
+  # `conduit-data` badger volume, so restarts resume without re-snapshotting.
+  # In-network only: no host ports; host observers use the cdc pipeline's
+  # ClickHouse landing (or `docker compose exec conduit wget -qO- :8080/healthz`).
+  conduit:
+    image: ghcr.io/conduitio/conduit:v0.20.0@sha256:e674b7f07d5a0eae98df99521ea81c3b6218ef3e50d724e22797f82e4b778c9a
+    command:
+      - /app/conduit
+      - run
+      - --pipelines.path
+      - /etc/conduit/pipelines
+      - --db.badger.path
+      - /data/conduit.db
+    volumes:
+      - ./conduit/conduit.yaml:/etc/conduit/pipelines/conduit.yaml:ro
+      - conduit-data:/data
+    mem_limit: 250m
+    networks:
+      - udp-net
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+    healthcheck:
+      # /healthz (liveness) is on the HTTP API :8080; :8084 is gRPC-only.
+      test: ["CMD-SHELL", "wget -qO- 'http://localhost:8080/healthz'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # S7 — cdc pipeline: topic `pg_changes` (conduit's OpenCDC records) →
+  # udp.app_users_cdc. Reads every change op; current-state dedupe is
+  # read-time (argMax per id keyed on the kafka offset, latest op wins,
+  # op='d' ids excluded — see clickhouse/cdc.sql).
+  cdc:
+    image: redpandadata/connect:4.113.0
+    command: ["run", "/etc/connect/cdc.yaml"]
+    volumes:
+      - ./connect/cdc.yaml:/etc/connect/cdc.yaml:ro
+    environment:
+      CLICKHOUSE_DSN: clickhouse://${CLICKHOUSE_USER:-admin}:${CLICKHOUSE_PASSWORD:-udp-dev-password}@clickhouse:9000/${CLICKHOUSE_DB:-udp}?dial_timeout=10s
+    ports:
+      - "127.0.0.1:4199:4195" # /metrics + /ping republished for host curl
+    mem_limit: 250m
+    networks:
+      - udp-net
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+      conduit:
+        condition: service_healthy
+    restart: on-failure
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- 'http://localhost:4195/ping'"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
 networks:
   udp-net:
     driver: bridge
@@ -303,3 +388,4 @@ volumes:
   redpanda-data:
   clickhouse-data:
   postgres-data:
+  conduit-data:

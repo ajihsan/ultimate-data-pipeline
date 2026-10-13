@@ -6,6 +6,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "confluent-kafka>=2.6",
+    # S7 udp-pg-mutate: the only new runtime dep. psycopg (v3, binary wheels)
+    # is the clean server-protocol client for the CDC mutation driver —
+    # confluent-kafka covers Kafka only, and psycopg2 would add a build dep.
+    "psycopg[binary]>=3.2",
     "pydantic>=2.9",
     "faker>=30",
 ]
@@ -30,6 +34,7 @@ dev = [
 udp = "udp.cli:main"
 udp-generate = "udp.generator.tickets:main"
 udp-eval = "udp.jev_eval:main"
+udp-pg-mutate = "udp.pg_mutator:main"
 
 [build-system]
 requires = ["hatchling"]
