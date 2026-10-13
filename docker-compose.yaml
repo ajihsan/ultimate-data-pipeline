@@ -1,12 +1,12 @@
-# Streaming infra (S3) — redpanda, clickhouse, postgres, redpanda console.
-# Connect/mock (S4), notifier (S6) and conduit (S7) are appended by their own
-# subtasks; this file must stay green without them.
+# Streaming infra (S3) + Connect pipelines & mock (S4).
+# Notifier (S6) and conduit (S7) are appended by their own subtasks.
 #
 # Pinned images (linux/amd64, verified 2026-10-13):
 #   redpandadata/redpanda:v26.2.4             sha256:c98c2f04a751e6646012cc701bac5183252cee44c88ba1dfa412e4c7124f2e89
 #   clickhouse/clickhouse-server:26.9.13.15   sha256:04fc72b8a58e58200c706f375ef81ec7112de3515e898de63f6c72843d7a2eeb
 #   postgres:16-alpine                        sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
 #   redpandadata/console:v3.12.0              sha256:9dc0cd55db172c6be9c2ff8a51f33a14395f7675fa7fbc002c277f3b96115c27
+#   redpandadata/connect:4.113.0              sha256:1bdf3246c32985dfef0e4a82e6866f082887a095f9e0e5b778dbe38add70c5d8
 #
 # Kafka listener layout (single-node dev):
 #   PLAINTEXT 29092 — intra-compose clients (console, S4 connect, S7 conduit)
@@ -19,7 +19,8 @@
 #
 # Every host port is bound to 127.0.0.1 — this is a shared homelab; nothing here
 # is reachable from the LAN. Memory caps: redpanda 1.5G, clickhouse 3G (with a
-# 2.5G server-side ceiling), postgres 256m, console 200m.
+# 2.5G server-side ceiling), postgres 256m, console 200m, connect 250m each.
+# Connect metrics are republished on the host as 4196 (ingest) / 4197 (decide).
 
 name: udp
 
@@ -145,6 +146,67 @@ services:
       - udp-net
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- 'http://localhost:8080/' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  # S4 — ingest pipeline: tickets → udp.tickets_raw (DLQ: tickets_dlq).
+  ingest:
+    image: redpandadata/connect:4.113.0
+    command: ["run", "/etc/connect/ingest.yaml"]
+    volumes:
+      - ./connect/ingest.yaml:/etc/connect/ingest.yaml:ro
+    environment:
+      CLICKHOUSE_DSN: clickhouse://${CLICKHOUSE_USER:-admin}:${CLICKHOUSE_PASSWORD:-udp-dev-password}@clickhouse:9000/${CLICKHOUSE_DB:-udp}?dial_timeout=10s
+    ports:
+      - "127.0.0.1:4196:4195" # /metrics + /ping republished for host curl
+    mem_limit: 250m
+    networks:
+      - udp-net
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+    restart: on-failure
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- 'http://localhost:4195/ping'"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  # S4 — decide pipeline: tickets → fast_decisions / model_decisions.
+  # MODEL_ENDPOINT_URL points at a host-run Laya (S5) by default; the
+  # compose.mock.yaml override retargets it at the in-network jev-mock.
+  decide:
+    image: redpandadata/connect:4.113.0
+    command: ["run", "/etc/connect/decide.yaml"]
+    volumes:
+      - ./connect/decide.yaml:/etc/connect/decide.yaml:ro
+    environment:
+      MODEL_ENDPOINT_URL: http://host.docker.internal:8081/v1/systemone
+      CLICKHOUSE_DSN: clickhouse://${CLICKHOUSE_USER:-admin}:${CLICKHOUSE_PASSWORD:-udp-dev-password}@clickhouse:9000/${CLICKHOUSE_DB:-udp}?dial_timeout=10s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:4197:4195" # /metrics + /ping republished for host curl
+    mem_limit: 250m
+    networks:
+      - udp-net
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+    restart: on-failure
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- 'http://localhost:4195/ping'"]
       interval: 10s
       timeout: 5s
       retries: 6

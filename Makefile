@@ -2,7 +2,7 @@
 # Plain `uv sync` exact-syncs .venv and would remove the S0 model runtime
 # (TheRock torch wheels + laya); `make sync` runs --inexact to preserve it.
 
-.PHONY: sync lint fmt typecheck test hooks model up down down-v logs demo load-test
+.PHONY: sync lint fmt typecheck test hooks model up up-mock down down-v logs demo load-test
 
 sync:
 	uv sync --inexact
@@ -27,6 +27,9 @@ model:
 
 up:
 	docker compose up -d --wait
+
+up-mock:
+	docker compose -f docker-compose.yaml -f compose.mock.yaml up -d --wait
 
 down:
 	docker compose down

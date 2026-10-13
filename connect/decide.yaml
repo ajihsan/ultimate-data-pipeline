@@ -1,0 +1,256 @@
+# S4 — decide pipeline: topic `tickets` → cascade decision path.
+#
+# FAST-PATH RULE TABLE — deterministic FIRST-MATCH priority, evaluated in the
+# order below on the lowercased ticket text (substring match). docs/rules.md
+# is the human-readable copy; tests/test_rules_doc.py asserts this block.
+#   rule 1: scam_report     conf 0.95 keywords: scam, fraud, phishing, fake, "charged twice", malware
+#   rule 2: billing         conf 0.90 keywords: invoice, charged, refund, subscription, declined, renewal, billing
+#   rule 3: bug             conf 0.90 keywords: crash, error, broken, "white screen", fail, stale, unreadable, duplicate, truncat, "null pointer"
+#   rule 4: access          conf 0.90 keywords: login, password, locked, 2fa, sso, expired, invite, session
+#   rule 5: feature_request conf 0.85 keywords: feature, request, "would be nice", suggest, "would love", "please add", "any chance", "it would help", "can we get"
+#   rule 6: complaint       conf 0.85 keywords: angry, terrible, worst, cancel, unacceptable, "not happy", "nothing loads", redesign
+#   rule 7: (no category → flag)   conf 0.40 ambiguous heuristics — garbled text (5+ consonant run), >40% caps, >=5 "!" or "?", <12 chars → FLAG for model
+#   rule 8: (no category → flag)   conf 0.45 no match → FLAG for model
+#
+# Confident verdicts (rules 1-6) build a FastDecision and fan out to
+# udp.fast_decisions + topic `fast_decisions`; the model is never touched.
+# Flagged verdicts (rules 7-8) POST the /v1/systemone contract to
+# MODEL_ENDPOINT_URL (750ms timeout, 1 retry, backoff on 429/503). EVERY
+# flagged event yields a ModelDecision row: the endpoint's answers on success,
+# or a degraded fallback (escalate/scam = 0, degraded = true) on failure —
+# counted in the `model_degraded_total` Prometheus counter.
+#
+# Health: GET :4195/ping; metrics: :4195/metrics.
+
+http:
+  address: 0.0.0.0:4195
+
+input:
+  kafka_franz:
+    seed_brokers:
+      - redpanda:29092
+    topics:
+      - tickets
+    consumer_group: udp-decide
+    start_from_oldest: true
+    # The model is single-worker (S0: ~15 dec/s ceiling): checkpoint_limit 1
+    # processes each partition strictly in lock-step — one message in flight.
+    checkpoint_limit: 1
+
+pipeline:
+  processors:
+    # Classify (rule table above). Tickets with no usable event_id/text are
+    # marked null-flagged: they match no case and drop (ingest already DLQ'd
+    # a copy). Unparseable tickets are normalized the same way by the catch.
+    - try:
+        - mapping: |
+            # The kafka_franz input auto-parses JSON, so `this` is the parsed
+            # ticket already. Field access on unparseable bytes errors below
+            # (caught by the catch, which normalizes to a dropped record).
+            root = this
+            let eid = root.event_id | ""
+            let text = root.text | ""
+            let low = $text.lowercase()
+            # Rule 7 inputs (applied only after rules 1-6 miss).
+            let bangs = $low.re_find_all("[!?]").length()
+            let garbled = $low.re_match("[bcdfghjklmnpqrstvwxz]{5}")
+            let letters = $text.re_find_all("[A-Za-z]").length()
+            let caps = $text.re_find_all("[A-Z]").length()
+            let caps_ratio = if $letters > 0 { $caps / $letters } else { 0.0 }
+            let shape_ambiguous = $garbled || $caps_ratio > 0.40 || $bangs >= 5 || $text.trim().length() < 12
+            # Keyword scan — the rule-table order IS this match order.
+            let has_scam = ["scam", "fraud", "phishing", "fake", "charged twice", "malware"].any(kw -> $low.contains(kw))
+            let has_billing = ["invoice", "charged", "refund", "subscription", "declined", "renewal", "billing"].any(kw -> $low.contains(kw))
+            let has_bug = ["crash", "error", "broken", "white screen", "fail", "stale", "unreadable", "duplicate", "truncat", "null pointer"].any(kw -> $low.contains(kw))
+            let has_access = ["login", "password", "locked", "2fa", "sso", "expired", "invite", "session"].any(kw -> $low.contains(kw))
+            let has_feature = ["feature", "request", "would be nice", "suggest", "would love", "please add", "any chance", "it would help", "can we get"].any(kw -> $low.contains(kw))
+            let has_complaint = ["angry", "terrible", "worst", "cancel", "unacceptable", "not happy", "nothing loads", "redesign"].any(kw -> $low.contains(kw))
+            let category = match {
+              $has_scam => "scam_report"
+              $has_billing => "billing"
+              $has_bug => "bug"
+              $has_access => "access"
+              $has_feature => "feature_request"
+              $has_complaint => "complaint"
+              _ => null
+            }
+            root.fast_flagged = match {
+              $eid == "" || $text == "" => null
+              $category != null => false
+              _ => true
+            }
+            root.fast_category = $category
+            root.fast_confidence = match {
+              $category == "scam_report" => 0.95
+              $category == "billing" => 0.90
+              $category == "bug" => 0.90
+              $category == "access" => 0.90
+              $category == "feature_request" => 0.85
+              $category == "complaint" => 0.85
+              $shape_ambiguous => 0.40
+              _ => 0.45
+            }
+    - catch:
+        - log:
+            level: WARN
+            message: "decide: unparseable ticket dropped (${! error() })"
+        - mapping: 'root = {"fast_flagged": null}'
+    # Route classification → record building (unmatched/junk passes through
+    # and is dropped by the output switch, strict_mode false).
+    - switch:
+        # ── Confident fast path: FastDecision record. No model call. ──
+        - check: 'this.fast_flagged == false'
+          processors:
+            - mapping: |
+                root = {
+                  "event_id": this.event_id,
+                  "category": this.fast_category,
+                  "confidence": this.fast_confidence,
+                  "decided_at": now(),
+                  "schema_version": this.schema_version | "",
+                }
+        # ── Flagged path: model call, or degraded fallback on ANY failure. ──
+        - check: 'this.fast_flagged == true'
+          processors:
+            # Stash ticket fields in metadata, then build the /v1/systemone
+            # request (the http processor replaces content with the response).
+            - mapping: |
+                meta ticket_event_id = this.event_id | ""
+                meta ticket_schema_version = this.schema_version | ""
+                root = {
+                  "model": "laya",
+                  "state": this.text | "",
+                  "questions": {
+                    "escalate_now": {"type": "noul"},
+                    "category": {"type": "choice", "options": ["complaint", "scam_report", "billing", "bug", "access", "feature_request"]}
+                  }
+                }
+            - try:
+                - http:
+                    url: ${MODEL_ENDPOINT_URL}
+                    verb: POST
+                    headers:
+                      Content-Type: application/json
+                    timeout: 750ms
+                    retries: 1
+                    backoff_on:
+                      - 429
+                      - 503
+                    retry_period: 100ms
+            # Endpoint failed (transport, timeout, or 429/503 after retries):
+            # count it and stamp a degraded fallback; catch clears the error.
+            - catch:
+                - metric:
+                    type: counter
+                    name: model_degraded_total
+                - mapping: |
+                    meta degraded = "true"
+                    meta model_error = error()
+            # Build the ModelDecision record — degraded fallback or answers.
+            - mapping: |
+                let is_degraded = meta("degraded") == "true"
+                let answers = match {
+                  $is_degraded => {"error": meta("model_error")}
+                  _ => this.answers
+                }
+                root = {
+                  "event_id": meta("ticket_event_id"),
+                  "decision_id": uuid_v4(),
+                  "question_type": "choice",
+                  "answers": $answers,
+                  # .number() coerces the response's json.Number values to
+                  # float64 so clickhouse-go can bind them to Float32.
+                  "escalate_probability": match {
+                    $is_degraded => 0.0
+                    _ => this.answers.escalate_now.noul.number()
+                  },
+                  "scam_probability": match {
+                    $is_degraded => 0.0
+                    _ => this.answers.category.probabilities.scam_report.number()
+                  },
+                  "degraded": $is_degraded,
+                  "decided_at": now(),
+                  "schema_version": meta("ticket_schema_version"),
+                  "answers_json": $answers.string(),
+                }
+
+output:
+  switch:
+    retry_until_success: true # sink outages retry instead of losing decisions
+    strict_mode: false # unparseable tickets (flagged by ingest) drop here
+    cases:
+      # FastDecision records → udp.fast_decisions + topic `fast_decisions`.
+      - check: 'this.category != null'
+        output:
+          broker:
+            pattern: fan_out
+            outputs:
+              - sql_insert:
+                  driver: clickhouse
+                  dsn: ${CLICKHOUSE_DSN}
+                  table: fast_decisions
+                  columns:
+                    - event_id
+                    - category
+                    - confidence
+                    - decided_at
+                    - schema_version
+                  args_mapping: |
+                    root = [
+                      this.event_id,
+                      this.category,
+                      this.confidence,
+                      this.decided_at.ts_format("2006-01-02 15:04:05.999", "UTC"),
+                      this.schema_version,
+                    ]
+                  batching:
+                    count: 100
+                    period: 1s
+              - kafka:
+                  addresses:
+                    - redpanda:29092
+                  topic: fast_decisions
+                  key: ${! this.event_id }
+      # ModelDecision records → udp.model_decisions + topic `model_decisions`.
+      - check: 'this.decision_id != null'
+        output:
+          broker:
+            pattern: fan_out
+            outputs:
+              - sql_insert:
+                  driver: clickhouse
+                  dsn: ${CLICKHOUSE_DSN}
+                  table: model_decisions
+                  columns:
+                    - decision_id
+                    - event_id
+                    - question_type
+                    - escalate_probability
+                    - scam_probability
+                    - degraded
+                    - decided_at
+                    - schema_version
+                    - answers_json
+                  args_mapping: |
+                    root = [
+                      this.decision_id,
+                      this.event_id,
+                      this.question_type,
+                      this.escalate_probability,
+                      this.scam_probability,
+                      this.degraded,
+                      this.decided_at.ts_format("2006-01-02 15:04:05.999", "UTC"),
+                      this.schema_version,
+                      this.answers_json,
+                    ]
+                  batching:
+                    count: 50
+                    period: 1s
+              - kafka:
+                  addresses:
+                    - redpanda:29092
+                  topic: model_decisions
+                  key: ${! this.event_id }
+
+metrics:
+  prometheus: {}

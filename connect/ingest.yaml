@@ -1,0 +1,101 @@
+# S4 — ingest pipeline: topic `tickets` → ClickHouse `udp.tickets_raw`.
+#
+# - kafka_franz input with consumer group `udp-ingest`: committed offsets make
+#   restarts resume where they left off (at-least-once; ReplacingMergeTree
+#   dedupes by event_id at read time, so replays are safe).
+# - Parse + basic validation (event_id / text / schema_version present);
+#   anything invalid is routed to topic `tickets_dlq` with its original raw
+#   payload, logged, and stamped with the reason as the record key.
+# - Valid tickets land in `udp.tickets_raw` via sql_insert (clickhouse driver,
+#   DSN from CLICKHOUSE_DSN), batched 100 rows / 1s for insert efficiency.
+# - Raw ingest latency NEVER touches the model: this pipeline has no HTTP
+#   processors; ingest latency is measured as wall-clock from generator start
+#   to row-count convergence, not per-event through any remote service.
+#
+# Metrics: Prometheus on :4195/metrics (input_received / output_sent counters).
+# Health:  GET :4195/ping (compose healthcheck).
+
+http:
+  address: 0.0.0.0:4195
+
+input:
+  kafka_franz:
+    seed_brokers:
+      - redpanda:29092
+    topics:
+      - tickets
+    consumer_group: udp-ingest
+    start_from_oldest: true
+
+pipeline:
+  processors:
+    # The kafka_franz input lazily auto-parses JSON content, so `this` is the
+    # parsed Ticket already; field access on unparseable bytes errors here and
+    # is stamped + cleared below so the switch can DLQ it with raw payload.
+    - try:
+        - mapping: 'root = this'
+    - catch:
+        - log:
+            level: WARN
+            message: "ingest: malformed ticket → tickets_dlq (${! error() })"
+        - mapping: 'meta dlq_reason = "malformed_json: " + error()'
+    # Field validation on parse-clean messages only (errored messages skip
+    # try-block children; their dlq_reason stamped above survives untouched).
+    - try:
+        - mapping: |
+            # .catch(true) keeps null/non-object JSON (e.g. literal `null`)
+            # out of the ClickHouse branch where a field access would error.
+            meta dlq_reason = match {
+              (this.type() != "object").catch(true) => "malformed_ticket: not an object"
+              (this.event_id | "") == "" => "missing_field: event_id"
+              (this.text | "") == "" => "missing_field: text"
+              (this.schema_version | "") == "" => "missing_field: schema_version"
+              _ => ""
+            }
+    # Clear any residual error flag so both switch branches accept their
+    # messages (catch children run only on failed messages, then unflag them).
+    - catch: []
+
+output:
+  switch:
+    retry_until_success: true # outages retry instead of losing tickets
+    cases:
+      # Invalid tickets → tickets_dlq, keyed by reason (also sent as a header).
+      # The | keeps the comparison explicit when dlq_reason is unset (null).
+      - check: '(meta("dlq_reason") | "") != ""'
+        output:
+          kafka:
+            addresses:
+              - redpanda:29092
+            topic: tickets_dlq
+            key: ${! meta("dlq_reason") }
+      # Valid tickets → udp.tickets_raw (DateTime64 columns take RFC 3339).
+      - output:
+          sql_insert:
+            driver: clickhouse
+            dsn: ${CLICKHOUSE_DSN}
+            table: tickets_raw
+            columns:
+              - event_id
+              - user_id
+              - text
+              - created_at
+              - ingested_at
+              - schema_version
+            args_mapping: |
+              root = [
+                this.event_id | "",
+                this.user_id | "",
+                this.text | "",
+                # clickhouse-go parses DateTime64 from "2006-01-02 15:04:05.999"
+                # (space-separated, UTC) — normalize the RFC 3339 wire values.
+                (this.created_at | now()).ts_format("2006-01-02 15:04:05.999", "UTC"),
+                (this.ingested_at | now()).ts_format("2006-01-02 15:04:05.999", "UTC"),
+                this.schema_version | "",
+              ]
+            batching:
+              count: 100
+              period: 1s
+
+metrics:
+  prometheus: {}
