@@ -57,12 +57,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # Half-load, burstless CI sizing of the same harness `make demo` runs —
+      # Half-load CI sizing of the same harness `make demo` runs, with a small
+      # burst so the drain/total/degraded-under-spike asserts run in CI too —
       # mock decision server, mock alert receiver; the compose `model` profile
       # is never started (no GPU exists on the runner anyway).
       SMOKE_STEADY_COUNT: "1000"
       SMOKE_STEADY_RATE: "50"
-      SMOKE_BURST_COUNT: "0"
+      SMOKE_BURST_COUNT: "1000"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
