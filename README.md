@@ -88,7 +88,7 @@ The real-model chaos/load run: 60 000 tickets @ 100 ev/s × 10 min (seed 7), `do
 | 17 | chaos: degraded after recovery ≤ 0.5% of model rows — **renegotiated** from =0: replay-window flagged bursts can exceed the 1500ms model timeout (runs 1–3 measured 0) | **PASS** (renegotiated) | 0/3024 (2026-10-14 re-verification); worst recorded 7/2782 (0.25%) replay-window only. Terminal-in-v1 by design: p=0 → below both thresholds → no false alerts, only a coverage gap |
 | 18 | RAM (informational, not gated) | — | peak RSS: model 1.6G/5G, clickhouse 429M/3G, decide 99M, notify 125M, ingest 79M, cdc 50M, conduit 28M, redpanda 70M/1.5G, postgres 20M |
 
-**Honest summary: 15/17 gated criteria PASS (one informational row); rows 16–17 are renegotiated criteria (marked in the rows, measured rationale included) and pass — re-verified 2026-10-14 after the deslop refactor.** The two renegotiations are restart-recovery semantics of the frozen v1 configs, both root-caused; correctness (no loss, no dupes, full coverage, rate limit, delivery) held through the kill.
+**Honest summary: 15/17 gated criteria PASS (one informational row); rows 16–17 are renegotiated criteria (marked in the rows, measured rationale included; ratified 2026-10-15) and pass — re-verified 2026-10-14 after the deslop refactor.** The two renegotiations are restart-recovery semantics of the frozen v1 configs, both root-caused; correctness (no loss, no dupes, full coverage, rate limit, delivery) held through the kill.
 
 ## Operational notes
 
