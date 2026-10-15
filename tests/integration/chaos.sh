@@ -135,7 +135,8 @@ GROUPS=(udp-ingest udp-decide udp-notify-fast udp-notify-model)
 echo "=== S8 chaos + load (steady $COUNT @ $RATE ev/s, kill@${KILL_AT_S}s, real model) ==="
 echo "--- 1/5 clean slate + real-model stack up"
 docker compose -f docker-compose.yaml -f compose.mock.yaml --profile model down -v >/dev/null 2>&1 || true
-"${COMPOSE[@]}" up -d --wait
+# --build: the alert-receiver image bakes tests/mocks/mock_alert_receiver.py.
+"${COMPOSE[@]}" up -d --wait --build
 
 # Model container health: compose --wait already gated on its healthcheck;
 # give the weights a moment, then confirm on the host-side eval port.
@@ -274,7 +275,8 @@ check_eq "chaos:DLQ rows" "0" \
 for t in "$RAW_DISTINCT $RAW_TOTAL" "$FAST_DISTINCT $FAST_TOTAL" "$MODEL_DISTINCT $MODEL_TOTAL"; do
   read -r DISTINCT TOTAL <<<"$t"
   DUPES=$((TOTAL - DISTINCT))
-  LIMIT=$(awk -v d="$DISTINCT" 'BEGIN { printf "%d", d * 1.1 }')
+  # +10% of distinct, per the label: 1.1× distinct let a 100% replay storm pass.
+  LIMIT=$(awk -v d="$DISTINCT" 'BEGIN { printf "%d", d * 0.1 }')
   if ((DUPES <= LIMIT)); then
     pass "chaos:dupes ≤ +10%" "dupes=$DUPES of distinct=$DISTINCT (total=$TOTAL)"
   else
