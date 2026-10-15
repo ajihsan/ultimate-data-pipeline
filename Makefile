@@ -23,9 +23,10 @@ hooks:
 	uvx prek run -a
 
 model:
-	# Host-run Laya server (127.0.0.1:8081). NOTE: on this box ufw drops
-	# container→host traffic, so the decide container can only reach this if
-	# a rule allows the docker subnets:
+	# Host-run Laya server. The decide container reaches it as
+	# http://host.docker.internal:8081 (set MODEL_ENDPOINT_URL accordingly),
+	# which needs MODEL_HOST=0.0.0.0 (the default binds 127.0.0.1) and, on
+	# this box, a ufw rule for the docker subnets:
 	#   pkexec ufw allow from 172.16.0.0/12 to any port 8081 proto tcp
 	# Otherwise use `make model-container` (in-network, no root needed).
 	uv run python -m udp.model_server

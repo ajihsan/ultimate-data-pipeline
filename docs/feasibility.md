@@ -175,7 +175,7 @@ kernel sysfs sampler thread), RSS, NaN/error counters:
 ```python
 #!/usr/bin/env python3
 # (trimmed to essentials; full listing preserved in session /tmp/opencode/s0/)
-import json, math, statistics, sys, threading, time
+import json, math, os, statistics, sys, threading, time
 os.environ.setdefault("USE_TF", "0")
 import laya, torch
 

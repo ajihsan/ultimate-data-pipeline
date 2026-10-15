@@ -27,11 +27,14 @@ Every raw table needs dedupe AT READ TIME — replays are legal (at-least-once e
 
 ## Table inventory (v2 reads from here)
 
-- `udp.tickets_raw` — raw tickets (event_id, user_id, text, created_at, ingested_at, schema_version)
-- `udp.fast_decisions` — rule-tier verdicts (event_id, category, confidence, decided_at)
-- `udp.model_decisions` — model-tier verdicts (decision_id, event_id, question_type, escalate/scam probability, degraded, answers_json)
-- `udp.alerts` — trigger log (decision_id, event_id, channel, suppressed, created_at)
+- `udp.tickets_raw` — raw tickets (event_id, user_id, text, created_at, ingested_at, schema_version, ingested_batch_ts)
+- `udp.fast_decisions` — rule-tier verdicts (event_id, category, confidence, decided_at, ingested_batch_ts)
+- `udp.model_decisions` — model-tier verdicts (decision_id, event_id, question_type, escalate/scam probability, degraded, answers_json, ingested_batch_ts)
+- `udp.alerts` — trigger log (decision_id, event_id, channel, suppressed, created_at, ingested_batch_ts)
 - `udp.app_users_cdc` — postgres app_users change log (id, email, plan, status, created_at, updated_at, op, position, offset, landed_at)
+
+`ingested_batch_ts` / `landed_at` (DEFAULT now()) are landing provenance, never
+written by the pipelines.
 
 Schemas stay authoritative in this repo: [schemas.md](schemas.md) (wire + DDL). The v2 repo should vendor or link, not fork, those definitions.
 

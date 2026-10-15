@@ -137,6 +137,12 @@ container RSS 1.53 GiB (limit 5 GiB); torch peak allocation 2.5 GiB
 
 ### Steady — `udp-generate --profile steady --rate 100 --count 6000 --seed 7`
 
+> **SUPERSEDED (S5b):** the latency rows below are the PRE-S5b numbers (the
+> 500 ms budget miss was the single-consumer backlog, root-caused in the
+> analysis below). The S5b retune (threads 4, checkpoint_limit 1024) brought
+> them to fast-path p95 81 ms / model-path p95 467 ms — see the S8 acceptance
+> table in README.md. Kept for the root-cause record.
+
 | assertion | result |
 |---|---|
 | tickets_raw | 6000 ✓ |

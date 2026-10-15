@@ -19,6 +19,10 @@ definitions plus the smoke/chaos SQL asserts, not by pydantic at runtime.
 enters the stream; deciders stamp `decided_at`. End-to-end latency is
 `p95 = decided_at - ingested_at`.
 
+The four `clickhouse/init.sql` tables also carry an `ingested_batch_ts
+DateTime64(3) DEFAULT now()` landing-provenance column (never written by the
+pipelines); `udp.app_users_cdc`'s equivalent is `landed_at`.
+
 ## Ticket — topic `tickets` → `udp.tickets_raw`
 
 | field | type | notes |
@@ -116,7 +120,7 @@ probabilities are 0.
 | `event_id` | str | same ticket as the alert (required) |
 | `schema_version` | str | default `"1.0.0"` |
 | `decision_id` | str | originating verdict; fast path synthesizes `fast:<event_id>` (required) |
-| `channel` | str | `telegram`, `discord`, the fan-out list `telegram,discord`, or `mock` (required) |
+| `channel` | str | `telegram`, `discord`, the fan-out list `telegram,discord`, or `mock` (the value recorded when no chat provider is configured: `log` or `mock` mode) (required) |
 | `suppressed` | bool | true = rate limiter dropped delivery, row still recorded (default false) |
 | `created_at` | datetime | alert attempt moment, tz-aware (required) |
 
