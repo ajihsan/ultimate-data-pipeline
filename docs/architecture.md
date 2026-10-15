@@ -76,6 +76,7 @@ Wire schemas (Ticket, FastDecision, ModelDecision, AlertEvent) and every ClickHo
 | decide/notify SIGKILL | ~40s franz session-timeout rebalance, then replay of ≤~10s (checkpoint_limit 1024); replayed decisions/alerts are made no-ops by notify's dedupe; the fast/model decision tables grow a thin duplicate tail (read-time dedupe contract) |
 | pipeline (re)start, first fetch | one-time ~2–4.4s franz chunk warm-up before the first decisions land |
 | conduit restart | checkpoints (incl. the replication slot) persist in the `conduit-data` badger volume — resumes without re-snapshotting; replays re-append rows whose dedupe is read-time (argMax by kafka offset) |
+| malformed `pg_changes` record (conduit bug or manual write) | cdc retries it indefinitely (offset pinned behind it, logs ~1/s) while newer records still land; nothing is lost, and the group recovers when topic retention drops the record |
 | alert POST failure | retried (3s timeout, 2 retries, backoff on 429/503), then logged (`notify_delivery_failed_total`) — the alerts row ALWAYS lands. Alerts are exactly-once per decision_id (dedupe on the alerts row), barring co-batched duplicates from an upstream producer retry; delivery itself is at-least-once |
 | rate limiter RAM counter loss | restart mid-minute re-arms the window (durable decision_id dedupe still prevents double rows); a counter read/update failure fails OPEN (guardrail degraded for that window, rows never blocked) |
 
