@@ -24,7 +24,8 @@ Semantics:
   (`MODEL_ENDPOINT_URL`, 1500 ms timeout, 1 retry, backoff on 429/503). Every
   flagged event yields a `ModelDecision` row — the model's answers on success,
   or a degraded fallback (`escalate_probability`/`scam_probability` = 0,
-  `degraded = true`, `answers = {"error": <message>}`) when the endpoint fails;
+  `degraded = true`, `answers = {"error": <message>}`) when the endpoint fails
+  or answers a 200 the pipeline cannot read;
   degraded verdicts increment the `model_degraded_total` Prometheus counter.
   Concurrency is capped so that never happens in load: decide runs 4 pipeline
   workers (`pipeline.threads`), so concurrent model calls cap at 4 → the

@@ -17,7 +17,8 @@
 # Flagged verdicts (rules 7-8) POST the /v1/systemone contract to
 # MODEL_ENDPOINT_URL. EVERY flagged event yields a ModelDecision row: the
 # endpoint's answers on success, or a degraded fallback (escalate/scam = 0,
-# degraded = true) on failure — counted in `model_degraded_total`.
+# degraded = true) on any failure — transport, timeout, retries exhausted, or
+# a 200 whose answers shape is unreadable — counted in `model_degraded_total`.
 #
 # S5b concurrency (measured; math at each knob): threads 4, checkpoint_limit
 # 1024, http timeout 1500ms.
@@ -150,8 +151,18 @@ pipeline:
                       - 429
                       - 503
                     retry_period: 100ms
-            # Endpoint failed (transport, timeout, or 429/503 after retries):
-            # count it and stamp a degraded fallback; catch clears the error.
+                # Validate the answers shape inside the try: a 200 whose shape
+                # this mapping cannot read (missing escalate_now.noul or
+                # category.probabilities.scam_report) must degrade in the
+                # catch below — the output switch drops unmatched messages
+                # silently (strict_mode false).
+                - mapping: |
+                    let escalate = this.answers.escalate_now.noul.number()
+                    let scam = this.answers.category.probabilities.scam_report.number()
+                    meta model_answers_json = this.answers.string()
+            # Endpoint failed (transport, timeout, 429/503 after retries, or an
+            # unreadable 200): count it and stamp a degraded fallback; catch
+            # clears the error.
             - catch:
                 - metric:
                     type: counter
@@ -159,12 +170,13 @@ pipeline:
                 - mapping: |
                     meta degraded = "true"
                     meta model_error = error()
-            # Build the ModelDecision record — degraded fallback or answers.
+            # Build the ModelDecision record from the validated answers (or the
+            # degraded fallback) — nothing here can fail on a response shape.
             - mapping: |
                 let is_degraded = meta("degraded") == "true"
                 let answers = match {
                   $is_degraded => {"error": meta("model_error")}
-                  _ => this.answers
+                  _ => meta("model_answers_json").parse_json()
                 }
                 root = {
                   "event_id": meta("ticket_event_id"),
@@ -175,11 +187,11 @@ pipeline:
                   # float64 so clickhouse-go can bind them to Float32.
                   "escalate_probability": match {
                     $is_degraded => 0.0
-                    _ => this.answers.escalate_now.noul.number()
+                    _ => $answers.escalate_now.noul.number()
                   },
                   "scam_probability": match {
                     $is_degraded => 0.0
-                    _ => this.answers.category.probabilities.scam_report.number()
+                    _ => $answers.category.probabilities.scam_report.number()
                   },
                   "degraded": $is_degraded,
                   "decided_at": now(),

@@ -71,7 +71,7 @@ Wire schemas (Ticket, FastDecision, ModelDecision, AlertEvent) and every ClickHo
 | failure | behavior |
 |---|---|
 | invalid ticket (malformed JSON / missing event_id·text·schema_version) | ingest routes a copy to topic `tickets_dlq` keyed by the reason; never silently dropped |
-| model endpoint down / timing out | decide stamps degraded fallback rows (p=0 → never alert) and keeps consuming; **model-tier alerting is down** while the endpoint is (fast path unaffected); SQL gauge: `SELECT count() FROM udp.model_decisions WHERE degraded AND decided_at > now() - INTERVAL 5 MINUTE` |
+| model endpoint down / timing out / unreadable 200 | decide stamps degraded fallback rows (p=0 → never alert) and keeps consuming; **model-tier alerting is down** while the endpoint is (fast path unaffected); SQL gauge: `SELECT count() FROM udp.model_decisions WHERE degraded AND decided_at > now() - INTERVAL 5 MINUTE` |
 | clickhouse insert failure | connect nacks and retries (`retry_until_success` on ingest/decide; notify's output switch is `strict_mode` with batching count:1 so an alert row lands before its input ack) |
 | decide/notify SIGKILL | ~40s franz session-timeout rebalance, then replay of ≤~10s (checkpoint_limit 1024); replayed decisions/alerts are made no-ops by notify's dedupe; the fast/model decision tables grow a thin duplicate tail (read-time dedupe contract) |
 | pipeline (re)start, first fetch | one-time ~2–4.4s franz chunk warm-up before the first decisions land |
