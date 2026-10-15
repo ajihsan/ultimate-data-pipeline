@@ -250,6 +250,12 @@ check_eq "fault:malformed ticket → tickets_dlq" "1" "$DLQ_ROWS"
 check_eq "fault:malformed ticket not in tickets_raw" "0" \
   "$(chq "SELECT count() FROM udp.tickets_raw WHERE event_id = ''")"
 
+# notify: a scam-shaped payload with no event_id must be dropped, not alerted.
+docker compose exec -T redpanda rpk topic produce fast_decisions <<<"{\"category\":\"scam_report\",\"confidence\":0.9}" >/dev/null
+sleep 5
+check_eq "fault:malformed decision → no alert row" "0" \
+  "$(chq "SELECT count() FROM udp.alerts WHERE event_id = ''")"
+
 if [[ "$MODE" == "--mock" ]]; then
   # decide: a 200 whose answers shape is unreadable must degrade the row, not
   # drop it (the output switch drops unmatched messages silently).

@@ -70,11 +70,14 @@ pipeline:
   threads: 1
   processors:
     # Normalize both decision shapes into one evaluation record; the fast path
-    # gets a synthesized fast:<event_id> dedupe key. Unparseable topic bytes
-    # are dropped (the decisions tables hold the parsed copies).
+    # gets a synthesized fast:<event_id> dedupe key. Unparseable bytes and
+    # payloads with neither decision_id nor event_id throw into the catch
+    # below and are dropped with a WARN log (the decisions tables hold the
+    # parsed copies).
     - try:
         - mapping: |
             root = match {
+              this.type() != "object" => throw("not a JSON object"),
               this.decision_id != null => {
                 "source": "model",
                 "event_id": this.event_id | "",
@@ -87,7 +90,7 @@ pipeline:
                 "decided_at": this.decided_at | now(),
                 "schema_version": this.schema_version | "",
               }
-              _ => {
+              (this.event_id | "") != "" => {
                 "source": "fast",
                 "event_id": this.event_id | "",
                 "decision_id": "fast:" + (this.event_id | ""),
@@ -99,6 +102,7 @@ pipeline:
                 "decided_at": this.decided_at | now(),
                 "schema_version": this.schema_version | "",
               }
+              _ => throw("no decision_id and no event_id"),
             }
     - catch:
         - log:
