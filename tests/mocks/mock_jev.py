@@ -8,6 +8,8 @@ verified end-to-end against this canned, wire-compatible stand-in:
         noul  → {"noul": 0.92}                      (p of yes, fixed)
         score → {"scores": {"escalate": 0.92, "scam": 0.07}}
         choice→ {"choice": ..., "probabilities": {...sum to 1...}, "confidence": 0.87}
+      state containing FAULT_PROBE_TEXT → the choice answer is dropped: a 200
+        whose shape decide cannot read (degraded-fallback regression hook).
     GET  /healthz     → {"status": "ok"}
 
 Choice probabilities are keyword-derived from ``state`` when possible, else
@@ -31,6 +33,11 @@ NUA_P_YES = 0.92
 
 CONFIDENCE = 0.87
 """Canned confidence reported with every choice answer."""
+
+FAULT_PROBE_TEXT = "smoke fault probe malformed response"
+"""State marker that drops the choice answer from the response — a 200 whose
+shape decide's extraction cannot read. Pinned by tests/integration/smoke.sh to
+prove an unreadable response degrades instead of dropping the decision."""
 
 #: Simple keyword hints the mock uses to skew choice probabilities; mirrors the
 #: pipeline's rule table loosely enough for downstream keyword assertions.
@@ -114,6 +121,8 @@ def systemone(req: Mapping[str, Any]) -> dict[str, Any]:
     state = str(req.get("state") or "")
     questions = req.get("questions") or {}
     answers = {name: _answer_question(q, state) for name, q in questions.items()}
+    if FAULT_PROBE_TEXT in state:
+        answers.pop("category", None)
     return {"answers": answers}
 
 

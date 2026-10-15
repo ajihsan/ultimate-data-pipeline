@@ -14,25 +14,28 @@
 #
 # Phases: clean slate (`down -v`) → healthchecks → steady 2000 @ 100 ev/s
 # (seed 7) → SQL asserts (counts, 95/5 split ±3%, degraded=0, DLQ=0, data
-# quality, alert joins) → scam-spike burst (`--profile demo`, seed 11 — a
-# different seed than steady ON PURPOSE: the generator derives event ids from
-# the seed, so a repeated seed would collide with the steady phase in
-# tickets_raw) → degraded=0 + drain ≤60 s → notifier joins (delivered ⊆
-# receiver receipts, rate limit ≤10/min) → CDC: 2 mutations land ≤10 s and
-# the CH current-state diff vs Postgres is empty.
+# quality, alert joins + thresholds) → scam-spike burst (`--profile demo`,
+# seed 11 — a different seed than steady ON PURPOSE: the generator derives
+# event ids from the seed, so a repeated seed would collide with the steady
+# phase in tickets_raw) → fault paths (malformed ticket → DLQ; unreadable
+# model response → degraded row, mock only) → notifier joins (delivered ⊆
+# receiver receipts, rate limit ≤10/min, trigger p95 ≤2 s) → CDC: 2 mutations
+# land ≤10 s and the CH current-state diff vs Postgres is empty.
 #
 # Prints a PASS/FAIL table; exits non-zero on any FAIL.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 MODE="${1:---mock}"
+# --build: the mock images (jev-mock, alert-receiver) bake tests/mocks/*.py —
+# a stale local image would silently test old mock code (CI builds fresh).
 case "$MODE" in
   --mock)
-    UP_ARGS=(-f docker-compose.yaml -f compose.mock.yaml up -d --wait)
+    UP_ARGS=(-f docker-compose.yaml -f compose.mock.yaml up -d --wait --build)
     DOWN_ARGS=(-f docker-compose.yaml -f compose.mock.yaml --profile model down -v)
     ;;
   --model)
-    UP_ARGS=(-f docker-compose.yaml -f compose.mock.yaml -f tests/integration/chaos.compose.yaml --profile model up -d --wait)
+    UP_ARGS=(-f docker-compose.yaml -f compose.mock.yaml -f tests/integration/chaos.compose.yaml --profile model up -d --wait --build)
     DOWN_ARGS=(-f docker-compose.yaml -f compose.mock.yaml --profile model down -v)
     ;;
   *)
@@ -121,14 +124,18 @@ STEADY_SEED="${SMOKE_STEADY_SEED:-7}"
 BURST_COUNT="${SMOKE_BURST_COUNT:-18000}"
 BURST_SEED="${SMOKE_BURST_SEED:-11}"
 
+#: Marker text the mock (tests/mocks/mock_jev.py FAULT_PROBE_TEXT) turns into
+#: a malformed answers block; dodges the rule keywords so decide flags it.
+FAULT_PROBE_TEXT="smoke fault probe malformed response"
+
 echo "=== S8 smoke (mode: $MODE, steady ${STEADY_COUNT} @ ${STEADY_RATE}/s, burst ${BURST_COUNT}) ==="
-echo "--- 1/7 clean slate (docker compose down -v)"
+echo "--- 1/8 clean slate (docker compose down -v)"
 docker compose "${DOWN_ARGS[@]}" >/dev/null 2>&1 || true
 
-echo "--- 2/7 stack up"
+echo "--- 2/8 stack up"
 docker compose "${UP_ARGS[@]}"
 
-echo "--- 3/7 healthchecks"
+echo "--- 3/8 healthchecks"
 H_FAIL=0
 hp() { # name url
   if curl -fsS --max-time 5 "$2" >/dev/null 2>&1; then pass "health:$1" "ok"; else fail "health:$1" "unreachable: $2"; H_FAIL=1; fi
@@ -164,7 +171,7 @@ if ((H_FAIL)); then
   exit 1
 fi
 
-echo "--- 4/7 steady: ${STEADY_COUNT} @ ${STEADY_RATE} ev/s (seed ${STEADY_SEED})"
+echo "--- 4/8 steady: ${STEADY_COUNT} @ ${STEADY_RATE} ev/s (seed ${STEADY_SEED})"
 STEADY_T0=$(date +%s)
 uv run udp-generate --profile steady --rate "$STEADY_RATE" --count "$STEADY_COUNT" --seed "$STEADY_SEED" >/dev/null
 DRAIN_S=$(wait_drain 5 180) || { fail "steady:drain" "groups never drained"; DRAIN_S=999; }
@@ -199,9 +206,23 @@ check_eq "alerts:join fast alerts w/o fast_decisions row" "0" \
   "$(chq "SELECT count() FROM udp.alerts a
           WHERE a.decision_id LIKE 'fast:%'
             AND a.event_id NOT IN (SELECT DISTINCT event_id FROM udp.fast_decisions)")"
+# S9's "every alert joins a QUALIFYING decision": the thresholds themselves.
+check_eq "alerts:model alerts below thresholds" "0" \
+  "$(chq "SELECT count() FROM udp.alerts a
+          INNER JOIN (SELECT decision_id,
+                             argMax(escalate_probability, decided_at) AS escalate,
+                             argMax(scam_probability, decided_at) AS scam
+                      FROM udp.model_decisions GROUP BY decision_id) m USING (decision_id)
+          WHERE a.decision_id NOT LIKE 'fast:%'
+            AND m.escalate < ${THRESHOLD_ESCALATE_P:-0.75} AND m.scam < ${THRESHOLD_SCAM_P:-0.35}")"
+check_eq "alerts:fast alerts below thresholds" "0" \
+  "$(chq "SELECT count() FROM udp.alerts a
+          INNER JOIN (SELECT DISTINCT event_id, category, confidence FROM udp.fast_decisions) f ON a.event_id = f.event_id
+          WHERE a.decision_id LIKE 'fast:%'
+            AND (f.category != 'scam_report' OR f.confidence < 0.85)")"
 
 if [[ "$BURST_COUNT" != "0" ]]; then
-  echo "--- 5/7 burst demo: --profile demo (${BURST_COUNT} events, seed ${BURST_SEED})"
+  echo "--- 5/8 burst demo: --profile demo (${BURST_COUNT} events, seed ${BURST_SEED})"
   BURST_T0=$(date +%s)
   uv run udp-generate --profile demo --count "$BURST_COUNT" --seed "$BURST_SEED" >/dev/null
   BURST_END=$(date +%s)
@@ -213,10 +234,40 @@ if [[ "$BURST_COUNT" != "0" ]]; then
   check_eq "burst:tickets_raw total distinct" "$((STEADY_COUNT + BURST_COUNT))" \
     "$(chq "SELECT uniqExact(event_id) FROM udp.tickets_raw")"
 else
-  echo "--- 5/7 burst demo: SKIPPED (SMOKE_BURST_COUNT=0)"
+  echo "--- 5/8 burst demo: SKIPPED (SMOKE_BURST_COUNT=0)"
 fi
 
-echo "--- 6/7 notifier joins (delivered ⊆ receiver, rate limit)"
+echo "--- 6/8 fault paths"
+# ingest: one malformed line must land in tickets_dlq, never in tickets_raw.
+docker compose exec -T redpanda rpk topic produce tickets <<<"this is not a ticket" >/dev/null
+DLQ_ROWS=0
+for _ in $(seq 1 20); do
+  DLQ_ROWS=$(topic_count tickets_dlq)
+  if (( DLQ_ROWS >= 1 )); then break; fi
+  sleep 0.5
+done
+check_eq "fault:malformed ticket → tickets_dlq" "1" "$DLQ_ROWS"
+check_eq "fault:malformed ticket not in tickets_raw" "0" \
+  "$(chq "SELECT count() FROM udp.tickets_raw WHERE event_id = ''")"
+
+if [[ "$MODE" == "--mock" ]]; then
+  # decide: a 200 whose answers shape is unreadable must degrade the row, not
+  # drop it (the output switch drops unmatched messages silently).
+  MALFORMED_EID="smoke-fault-malformed"
+  printf '%s\n' "{\"event_id\":\"$MALFORMED_EID\",\"schema_version\":\"1.0.0\",\"text\":\"$FAULT_PROBE_TEXT\",\"category_hint\":\"feature_request\",\"user_id\":\"usr_smoke_fault\",\"created_at\":\"2026-01-01T00:00:00Z\",\"ingested_at\":\"2026-01-01T00:00:00Z\"}" \
+    | docker compose exec -T redpanda rpk topic produce tickets >/dev/null
+  MALFORMED_ROWS=0
+  for _ in $(seq 1 60); do
+    MALFORMED_ROWS=$(chq "SELECT count() FROM udp.model_decisions WHERE event_id = '$MALFORMED_EID' AND degraded")
+    if (( MALFORMED_ROWS >= 1 )); then break; fi
+    sleep 0.5
+  done
+  check_eq "fault:unreadable model response → degraded row (not dropped)" "1" "$MALFORMED_ROWS"
+else
+  echo "fault:unreadable model response check skipped (--model: the real server never returns a malformed shape)"
+fi
+
+echo "--- 7/8 notifier joins (delivered ⊆ receiver, rate limit, thresholds, trigger p95)"
 ALERTS_TOTAL=$(chq 'SELECT count() FROM udp.alerts')
 ALERTS_DELIVERED=$(chq 'SELECT count() FROM udp.alerts WHERE NOT suppressed')
 RECEIPTS_JSON=$(docker compose exec -T alert-receiver python -c \
@@ -237,9 +288,28 @@ check_eq "notifier:delivered alerts missing from receiver" "0" "$MISSING"
 PER_MIN_MAX=$(chq "SELECT max(n) FROM (SELECT toStartOfMinute(created_at) m, count() n
                     FROM udp.alerts WHERE NOT suppressed GROUP BY m)")
 check_le "notifier:max delivered in one minute (limit 10)" "$PER_MIN_MAX" "10"
-echo "alerts: total=$ALERTS_TOTAL delivered=$ALERTS_DELIVERED receiver_receipts=$RECEIPT_N"
+# S9's trigger latency: decided_at (event-embedded) → receiver receipt.
+TRIGGER_P95=$(RECEIPTS="$RECEIPTS_JSON" uv run python -c '
+import datetime as dt, json, os
 
-echo "--- 7/7 CDC: 2 mutations through the conduit bus"
+def ts(value):
+    return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")) if value else None
+
+deltas = sorted(
+    (ts(r["received_at"]) - ts(r["decided_at"])).total_seconds()
+    for r in json.loads(os.environ["RECEIPTS"])
+    if r.get("received_at") and r.get("decided_at")
+)
+print(round(deltas[max(0, int(len(deltas) * 0.95) - 1)], 3) if deltas else "none")
+')
+if [[ "$TRIGGER_P95" == "none" ]]; then
+  fail "notifier:trigger p95 ≤2s (receipts)" "no receipts with decided_at"
+else
+  check_le "notifier:trigger p95 ≤2s (receipts)" "$TRIGGER_P95" "2"
+fi
+echo "alerts: total=$ALERTS_TOTAL delivered=$ALERTS_DELIVERED receiver_receipts=$RECEIPT_N trigger_p95=${TRIGGER_P95}s"
+
+echo "--- 8/8 CDC: 2 mutations through the conduit bus"
 CDC_BEFORE=$(chq 'SELECT count() FROM udp.app_users_cdc')
 uv run udp-pg-mutate --mode mix --count 2 --seed 8 >/dev/null
 CDC_OK=0
