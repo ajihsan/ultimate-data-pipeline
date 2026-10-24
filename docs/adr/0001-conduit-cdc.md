@@ -28,11 +28,20 @@ postgres and kafka connectors** bundled in the same binary (no extra
 containers or registries needed on v0.20.0). It gives us the *bus-first*
 shape the realtime design called for:
 
-```
-postgres app_users ──(conduit: snapshot + WAL/logrepl CDC)──► redpanda topic
-                                                            `pg_changes`
-`pg_changes` ──(connect `cdc` pipeline: bloblang → sql_insert)──►
-                                                            udp.app_users_cdc
+```mermaid
+flowchart LR
+    PG[("Postgres<br/>app_users")]
+    CON["Conduit<br/>snapshot + logrepl CDC"]
+    RP[("Redpanda<br/>pg_changes")]
+    CDC["cdc (Connect)<br/>bloblang -> sql_insert"]
+    CH[("ClickHouse<br/>app_users_cdc")]
+    DLQ[("pg_changes_dlq")]
+
+    PG -->|snapshot + WAL| CON
+    CON -->|OpenCDC JSON| RP
+    RP --> CDC
+    CDC -->|valid| CH
+    CDC -.->|malformed| DLQ
 ```
 
 - Conduit handles the initial snapshot, the logical replication slot and

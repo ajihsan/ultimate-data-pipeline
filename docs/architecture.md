@@ -8,36 +8,61 @@ compose profile `model`.
 
 ## Flow
 
-```text
-udp-generate (host)
-   │  tickets (JSON, schema v1, seeded stream)
-   ▼
-redpanda ── topic: tickets ──────────────▶ ingest (connect) ──▶ clickhouse
-   │                                          │  valid  ────────▶ udp.tickets_raw (ReplacingMergeTree)
-   │                                          └─ invalid ───────▶ topic tickets_dlq (keyed by reason)
-   │
-   ├───────── topic: tickets ─────────────▶ decide (connect)
-   │                                          │  rules 1–6 match (≈95%) ──▶ udp.fast_decisions
-   │                                          │                            + topic fast_decisions
-   │                                          └─ flagged/ambiguous (≈5%)
-   │                                              │  POST /v1/systemone ──▶ model (Laya container)
-   │                                              │  ◀── answers (or degraded fallback)
-   │                                              └──────────────────────────▶ udp.model_decisions
-   │                                                                          + topic model_decisions
-   │
-   ├─ topic: fast_decisions ──┐
-   └─ topic: model_decisions ─┴──▶ notify (connect)
-                                     │  qualifies? (model: p≥0.35 scam ∨ p≥0.75 escalate;
-                                     │             fast: scam_report @ conf ≥0.85)
-                                     │  dedupe: count(udp.alerts WHERE decision_id=?) — restart-safe
-                                     │  rate limit: 10 delivered / epoch-minute (drop-and-record)
-                                     ├──▶ POST telegram / discord / mock-receiver (delivered only)
-                                     └──▶ udp.alerts (ALWAYS: delivered + suppressed)
+```mermaid
+flowchart TD
+    GEN["udp-generate<br/>(host, seeded tickets)"]
 
-postgres (app_users, wal_level=logical)
-   └──▶ conduit (pg source: snapshot + logrepl CDC)
-          └── topic: pg_changes (OpenCDC: op c|u|d, before/after, position)
-                 └──▶ cdc (connect) ──▶ udp.app_users_cdc (MergeTree change log)
+    subgraph INGEST["ingest: raw landing"]
+        ING["ingest (Connect)"]
+        RAW[("udp.tickets_raw<br/>ReplacingMergeTree")]
+        DLQ[("tickets_dlq")]
+    end
+
+    subgraph DECIDE["decide: cascade"]
+        DEC["decide (Connect)"]
+        FAST[("udp.fast_decisions")]
+        MD[("udp.model_decisions")]
+        FAST_TOPIC[("fast_decisions")]
+        MD_TOPIC[("model_decisions")]
+        MOD["model (Laya)<br/>POST /v1/systemone"]
+    end
+
+    subgraph NOTIFY["notify: qualify, dedupe, deliver"]
+        NOT["notify (Connect)"]
+        ALERTS[("udp.alerts")]
+        OUT["telegram / discord / log / mock"]
+    end
+
+    subgraph CDCPATH["CDC: Postgres to ClickHouse"]
+        PG[("Postgres app_users")]
+        CON["Conduit<br/>snapshot + logrepl"]
+        CHG[("pg_changes")]
+        CDCP["cdc (Connect)"]
+        APPC[("udp.app_users_cdc")]
+        PGDLQ[("pg_changes_dlq")]
+    end
+
+    RP[("Redpanda<br/>tickets, fast_decisions, model_decisions")]
+
+    GEN -->|tickets| RP
+    RP -->|tickets| ING
+    ING -->|valid| RAW
+    ING -.->|invalid| DLQ
+    RP -->|tickets| DEC
+    DEC -->|rules 1-6, about 95%| FAST
+    DEC <-->|flagged, about 5%| MOD
+    DEC -->|model decisions| MD
+    DEC -->|publish| FAST_TOPIC
+    DEC -->|publish| MD_TOPIC
+    FAST_TOPIC -->|fast_decisions| NOT
+    MD_TOPIC -->|model_decisions| NOT
+    NOT -->|qualifying decision| ALERTS
+    NOT -->|delivered| OUT
+    PG -->|snapshot + WAL| CON
+    CON -->|OpenCDC JSON| CHG
+    CHG --> CDCP
+    CDCP -->|valid| APPC
+    CDCP -.->|malformed| PGDLQ
 ```
 
 ## Component inventory

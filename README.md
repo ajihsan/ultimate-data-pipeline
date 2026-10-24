@@ -11,24 +11,40 @@ the Mastodon producer). The legacy stack remains in git history.
 
 ## Architecture
 
-```text
-                       ┌──────────────────────────── docker compose (udp-net, all ports 127.0.0.1) ───────────────────────────┐
-                       │                                                                                                       │
- udp-generate ────────▶│  redpanda :9092 ── topic `tickets` ────────────┐                                                      │
- (uv run udp-generate, │      ▲          │                              │                                                      │
- host python)          │      │          └──▶ ingest (connect) ────────┼──▶ clickhouse :8123/:9000                            │
-                       │      │               │ (DLQ → `tickets_dlq`)  │        ├─ udp.tickets_raw (ReplacingMT)              │
-                       │      │                                      │        ├─ udp.fast_decisions                         │
-                       │      └──▶ decide (connect) ────────────────┘        ├─ udp.model_decisions                           │
-                       │               │  rules 1–6 hit? → fast path        ├─ udp.alerts ◀── notify (connect)               │
-                       │               │  else FLAG ──▶ model (Laya)        │       thresholds scam≥.35 / escalate≥.75       │
-                       │               │          /v1/systemone             │       dedupe by decision_id                    │
-                       │               │          on :8081                  │       rate limit 10 delivered/min              │
-                       │               │                                    │       → telegram / discord / log / mock        │
-                       │  postgres :5432 ──▶ conduit (pg_changes) ──▶ topic `pg_changes` ──▶ cdc (connect) ──▶ udp.app_users_cdc│
-                       │                                                                                                       │
-                       │  console :8085 (Redpanda UI)   ·   connect metrics: 4196–4199 (/metrics, /ping)                        │
-                       └───────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    GEN["udp-generate<br/>(host)"]
+
+    subgraph COMPOSE["docker compose: udp-net, host ports on 127.0.0.1"]
+        RP[("Redpanda<br/>:9092")]
+        ING["ingest<br/>(Connect)"]
+        DEC["decide<br/>(Connect)"]
+        MOD["model<br/>(Laya, profile: model)<br/>:8081"]
+        NOT["notify<br/>(Connect)"]
+        CON["Conduit"]
+        CDC["cdc<br/>(Connect)"]
+        CONSOLE["Console<br/>:8085"]
+        CH[("ClickHouse<br/>:8123/:9000<br/>tickets_raw, fast_decisions,<br/>model_decisions, alerts, app_users_cdc")]
+        PG[("Postgres<br/>:5432")]
+        DLQ[("tickets_dlq")]
+        PGDLQ[("pg_changes_dlq")]
+    end
+
+    GEN -->|tickets| RP
+    RP -->|tickets| ING
+    RP -->|tickets| DEC
+    RP -.->|UI| CONSOLE
+    ING -->|valid| CH
+    ING -.->|invalid| DLQ
+    DEC -->|fast and model decisions| CH
+    DEC <-->|flagged, about 5%| MOD
+    DEC -->|fast_decisions, model_decisions| NOT
+    NOT -->|alerts| CH
+    NOT -->|telegram / discord / log / mock| OUT["chat providers"]
+    PG -->|snapshot + WAL| CON
+    CON -->|pg_changes| CDC
+    CDC -->|valid| CH
+    CDC -.->|malformed| PGDLQ
 ```
 
 - **ingest** reads topic `tickets` and writes `udp.tickets_raw`. A malformed
