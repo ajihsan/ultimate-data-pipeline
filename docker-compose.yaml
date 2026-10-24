@@ -334,6 +334,10 @@ services:
       - /etc/conduit/pipelines
       - --db.badger.path
       - /data/conduit.db
+    environment:
+      # Conduit expands ${POSTGRES_DSN} in the pipeline config. The value stays
+      # in the environment, not in the repository.
+      POSTGRES_DSN: postgres://${POSTGRES_USER:-udp}:${POSTGRES_PASSWORD:-udp-dev-password}@postgres:5432/${POSTGRES_DB:-udp}?sslmode=disable
     volumes:
       - ./conduit/conduit.yaml:/etc/conduit/pipelines/conduit.yaml:ro
       - conduit-data:/data

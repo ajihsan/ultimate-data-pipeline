@@ -16,11 +16,9 @@ pipelines:
         type: source
         plugin: builtin:postgres
         settings:
-          # Dev DSN = compose defaults (POSTGRES_* in .env); conduit pipeline
-          # configs do not do env expansion (no such feature documented as of
-          # v0.20.0), so this is literal. udp is the bootstrap superuser, which
-          # owns REPLICATION rights for the slot.
-          url: postgres://udp:udp-dev-password@postgres:5432/udp?sslmode=disable
+          # Conduit expands ${VAR} in pipeline configs. Compose builds
+          # POSTGRES_DSN from POSTGRES_*; no credential lives in this file.
+          url: ${POSTGRES_DSN}
           tables: app_users
           cdcMode: logrepl
           snapshotMode: initial

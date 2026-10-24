@@ -8,8 +8,8 @@ across runs; only wall-clock timestamps differ. Standalone ``udp-pg-mutate``
 script; wired into ``make mutate``.
 
 DSN resolution: ``POSTGRES_DSN`` wins if set; otherwise it is composed from
-the ``POSTGRES_*`` variables (see .env), falling back to the compose defaults
-(udp/udp-dev-password on localhost:5432/udp — the host-published port).
+the ``POSTGRES_*`` variables (see .env), falling back to the local development
+defaults in .env.example.
 """
 
 from __future__ import annotations
