@@ -1,5 +1,5 @@
 # Ultimate Data Pipeline — realtime toolchain.
-# Plain `uv sync` exact-syncs .venv and would remove the S0 model runtime
+# Plain `uv sync` exact-syncs .venv and would remove the model runtime
 # (TheRock torch wheels + laya); `make sync` runs --inexact to preserve it.
 
 .PHONY: sync lint fmt typecheck test hooks model model-container up up-model up-mock down down-v logs demo load-test mutate
@@ -9,6 +9,7 @@ sync:
 
 lint:
 	uv run ruff check .
+	uv run ruff format --check .
 
 fmt:
 	uv run ruff format .
@@ -52,7 +53,7 @@ down-v:
 logs:
 	docker compose logs -f --tail 100
 
-# S8 demo = the full end-to-end acceptance on the REAL model stack: clean
+# Demo = the full end-to-end acceptance on the REAL model stack: clean
 # slate → up-model → steady 2000 @ 100 ev/s → scam-spike burst → degraded=0,
 # delivery + rate-limit and CDC asserts. Phones aren't part of the harness —
 # alerts land on the in-network alert-receiver (swap NOTIFY_PROVIDER=telegram
@@ -60,13 +61,13 @@ logs:
 demo:
 	bash tests/integration/smoke.sh --model
 
-# S8 load + chaos acceptance (local-only, real model): 10 min @ 100 ev/s with
+# Load + chaos acceptance (local-only, real model): 10 min @ 100 ev/s with
 # a mid-run `docker compose kill` of decide+notify — see
 # tests/integration/chaos.sh for the scenario and asserts.
 load-test:
 	bash tests/integration/chaos.sh
 
-# S7 — deterministic app_users mutations through the conduit bus CDC path
+# Deterministic app_users mutations through the conduit bus CDC path
 # (postgres → pg_changes → app_users_cdc); prints each op for correlation.
 mutate:
 	uv run udp-pg-mutate --mode mix --count 10

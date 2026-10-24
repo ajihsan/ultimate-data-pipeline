@@ -71,7 +71,7 @@ select = [
 ]
 
 [tool.mypy]
-files = ["src"]
+files = ["src", "tests"]
 python_version = "3.12"
 disallow_untyped_defs = true
 warn_unused_ignores = true
