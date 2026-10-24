@@ -29,7 +29,8 @@ jobs:
           enable-cache: true
       - run: uv sync --frozen
       - run: uv run ruff check .
-      - run: uvx prek run -a
+      - run: uv run ruff format --check .
+      - run: uvx prek run -a --show-diff-on-failure
 
   typecheck:
     runs-on: ubuntu-latest
