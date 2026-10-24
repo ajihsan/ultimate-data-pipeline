@@ -1,30 +1,36 @@
 #!/usr/bin/env bash
-# S8 smoke — one-command end-to-end acceptance for the realtime pipeline.
+# End-to-end smoke acceptance for the realtime pipeline.
 #
 #   tests/integration/smoke.sh [--mock|--model]
 #
-#   --mock (default)  `make up-mock`-style stack: the jev-mock server answers
-#                     the flagged tickets, the alert-receiver records the
-#                     deliveries. No GPU / no model download — this is what
-#                     the CI `smoke` job runs.
-#   --model           same stack plus the real Laya model container
-#                     (compose profile `model`, TheRock ROCm wheels) answering
-#                     the flagged tickets. Local-only: needs the S0 .venv
-#                     model runtime + the GPU.
+#   --mock (default)  mock decision server and alert receiver; no GPU or model
+#                     download. The CI smoke job runs this mode.
+#   --model           adds the real Laya model container (compose profile
+#                     `model`). Local only: needs the model runtime and GPU.
 #
-# Phases: clean slate (`down -v`) → healthchecks → steady 2000 @ 100 ev/s
-# (seed 7) → SQL asserts (counts, 95/5 split ±3%, degraded=0, DLQ=0, data
-# quality, alert joins + thresholds) → scam-spike burst (`--profile demo`,
-# seed 11 — a different seed than steady ON PURPOSE: the generator derives
-# event ids from the seed, so a repeated seed would collide with the steady
-# phase in tickets_raw) → fault paths (malformed ticket → DLQ; unreadable
-# model response → degraded row, mock only) → notifier joins (delivered ⊆
-# receiver receipts, rate limit ≤10/min, trigger p95 ≤2 s) → CDC: 2 mutations
-# land ≤10 s and the CH current-state diff vs Postgres is empty.
+# Phases: clean slate -> healthchecks -> steady 2000 @ 100 ev/s (seed 7) ->
+# SQL asserts (counts, 95/5 split, degraded=0, DLQ=0, data quality, alert joins
+# and thresholds) -> scam burst (demo profile, seed 11; a different seed avoids
+# event-id collisions with the steady phase) -> fault paths (malformed ticket,
+# unreadable model response, empty model decision_id) -> notifier joins
+# (delivery, rate limit, trigger p95) -> CDC (DLQ path, 2 mutations, current
+# state matches Postgres).
 #
 # Prints a PASS/FAIL table; exits non-zero on any FAIL.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+
+# The SQL asserts must use the same thresholds and rate limit as the stack.
+# Never print this file: it can contain chat tokens.
+if [[ -f .env ]]; then
+  set -a
+  source .env
+  set +a
+elif [[ -f .env.example ]]; then
+  set -a
+  source .env.example
+  set +a
+fi
 
 MODE="${1:---mock}"
 # --build: the mock images (jev-mock, alert-receiver) bake tests/mocks/*.py —
@@ -57,6 +63,11 @@ chq() {
 topic_count() {
   docker compose exec -T redpanda rpk topic describe "$1" -p 2>/dev/null \
     | awk 'NR > 1 { s += $NF } END { print s + 0 }'
+}
+
+topic_partitions() {
+  docker compose exec -T redpanda rpk topic describe "$1" -p 2>/dev/null \
+    | awk 'NR > 1 { n++ } END { print n + 0 }'
 }
 
 # Consumer-group TOTAL-LAG (999999 if rpk fails or the group is gone).
@@ -115,9 +126,8 @@ check_between() { # name actual min max
 
 GROUPS=(udp-ingest udp-decide udp-notify-fast udp-notify-model)
 
-# Load sizing (the acceptance defaults are also what `make demo` runs). CI
-# halves the load and skips the burst — mock server, no GPU, no model
-# download: SMOKE_STEADY_COUNT=1000 SMOKE_STEADY_RATE=50 SMOKE_BURST_COUNT=0.
+# Load sizing. The defaults are what `make demo` runs. CI halves the steady
+# load and runs a small burst (see SMOKE_* in .github/workflows/ci.yml).
 STEADY_COUNT="${SMOKE_STEADY_COUNT:-2000}"
 STEADY_RATE="${SMOKE_STEADY_RATE:-100}"
 STEADY_SEED="${SMOKE_STEADY_SEED:-7}"
@@ -128,7 +138,7 @@ BURST_SEED="${SMOKE_BURST_SEED:-11}"
 #: a malformed answers block; dodges the rule keywords so decide flags it.
 FAULT_PROBE_TEXT="smoke fault probe malformed response"
 
-echo "=== S8 smoke (mode: $MODE, steady ${STEADY_COUNT} @ ${STEADY_RATE}/s, burst ${BURST_COUNT}) ==="
+echo "=== smoke (mode: $MODE, steady ${STEADY_COUNT} @ ${STEADY_RATE}/s, burst ${BURST_COUNT}) ==="
 echo "--- 1/8 clean slate (docker compose down -v)"
 docker compose "${DOWN_ARGS[@]}" >/dev/null 2>&1 || true
 
@@ -149,8 +159,9 @@ hex() { # name service port  (in-network services without host ports)
     H_FAIL=1
   fi
 }
+CONSOLE_PORT="${REDPANDA_CONSOLE_PORT:-8085}"
 hp "clickhouse" "http://127.0.0.1:8123/ping"
-hp "console(8085)" "http://127.0.0.1:8085/"
+hp "console(${CONSOLE_PORT})" "http://127.0.0.1:${CONSOLE_PORT}/"
 hp "ingest :4196" "http://127.0.0.1:4196/ping"
 hp "decide  :4197" "http://127.0.0.1:4197/ping"
 hp "notify  :4198" "http://127.0.0.1:4198/ping"
@@ -166,6 +177,7 @@ else
   fail "health:redpanda" "rpk cluster health failed"
   H_FAIL=1
 fi
+check_eq "topics:pg_changes single partition" "1" "$(topic_partitions pg_changes)"
 if ((H_FAIL)); then
   echo "healthchecks failed — aborting before load"
   exit 1
@@ -182,6 +194,8 @@ check_eq "steady:tickets_raw distinct" "$STEADY_COUNT" \
   "$(chq "SELECT uniqExact(event_id) FROM udp.tickets_raw")"
 check_eq "steady:DLQ rows" "0" "$(topic_count tickets_dlq)"
 check_eq "steady:degraded decisions" "0" "$(chq 'SELECT count() FROM udp.model_decisions WHERE degraded')"
+check_eq "steady:model decision_id derived from event_id" "0" \
+  "$(chq "SELECT count() FROM udp.model_decisions WHERE decision_id != concat('model:', event_id)")"
 FAST_N=$(chq "SELECT uniqExact(event_id) FROM udp.fast_decisions")
 MODEL_N=$(chq "SELECT uniqExact(event_id) FROM udp.model_decisions")
 check_between "steady:95/5 fast share" \
@@ -198,6 +212,8 @@ check_eq "steady:decision coverage misses (non-DLQ)" "0" \
           WHERE d.event_id = ''")"
 check_eq "alerts:dedupe (rows == distinct decision_id)" "0" \
   "$(chq 'SELECT count() - uniqExact(decision_id) FROM udp.alerts')"
+check_eq "alerts:one per event (rows == distinct event_id)" "0" \
+  "$(chq 'SELECT count() - uniqExact(event_id) FROM udp.alerts')"
 check_eq "alerts:join model alerts w/o model_decisions row" "0" \
   "$(chq "SELECT count() FROM udp.alerts a
           LEFT JOIN (SELECT DISTINCT decision_id FROM udp.model_decisions) m ON a.decision_id = m.decision_id
@@ -206,7 +222,7 @@ check_eq "alerts:join fast alerts w/o fast_decisions row" "0" \
   "$(chq "SELECT count() FROM udp.alerts a
           WHERE a.decision_id LIKE 'fast:%'
             AND a.event_id NOT IN (SELECT DISTINCT event_id FROM udp.fast_decisions)")"
-# S9's "every alert joins a QUALIFYING decision": the thresholds themselves.
+# Every alert must join a decision that meets the thresholds.
 check_eq "alerts:model alerts below thresholds" "0" \
   "$(chq "SELECT count() FROM udp.alerts a
           INNER JOIN (SELECT decision_id,
@@ -250,11 +266,42 @@ check_eq "fault:malformed ticket → tickets_dlq" "1" "$DLQ_ROWS"
 check_eq "fault:malformed ticket not in tickets_raw" "0" \
   "$(chq "SELECT count() FROM udp.tickets_raw WHERE event_id = ''")"
 
+# ingest: required fields are validated, not replaced with defaults.
+BAD_TS_EID="smoke-fault-bad-ts"
+printf '%s\n' "{\"event_id\":\"$BAD_TS_EID\",\"schema_version\":\"1.0.0\",\"text\":\"the app is broken\",\"user_id\":\"usr_smoke_fault\",\"created_at\":\"2026-99-99T99:99:99Z\",\"ingested_at\":\"2026-01-01T00:00:00Z\"}" \
+  | docker compose exec -T redpanda rpk topic produce tickets >/dev/null
+for _ in $(seq 1 20); do
+  DLQ_ROWS=$(topic_count tickets_dlq)
+  if (( DLQ_ROWS >= 2 )); then break; fi
+  sleep 0.5
+done
+check_eq "fault:invalid created_at → tickets_dlq" "2" "$DLQ_ROWS"
+check_eq "fault:invalid created_at not in tickets_raw" "0" \
+  "$(chq "SELECT count() FROM udp.tickets_raw WHERE event_id = '$BAD_TS_EID'")"
+
+MISSING_USER_EID="smoke-fault-missing-user"
+printf '%s\n' "{\"event_id\":\"$MISSING_USER_EID\",\"schema_version\":\"1.0.0\",\"text\":\"the app is broken\",\"created_at\":\"2026-01-01T00:00:00Z\",\"ingested_at\":\"2026-01-01T00:00:00Z\"}" \
+  | docker compose exec -T redpanda rpk topic produce tickets >/dev/null
+for _ in $(seq 1 20); do
+  DLQ_ROWS=$(topic_count tickets_dlq)
+  if (( DLQ_ROWS >= 3 )); then break; fi
+  sleep 0.5
+done
+check_eq "fault:missing user_id → tickets_dlq" "3" "$DLQ_ROWS"
+check_eq "fault:missing user_id not in tickets_raw" "0" \
+  "$(chq "SELECT count() FROM udp.tickets_raw WHERE event_id = '$MISSING_USER_EID'")"
+
 # notify: a scam-shaped payload with no event_id must be dropped, not alerted.
-docker compose exec -T redpanda rpk topic produce fast_decisions <<<"{\"category\":\"scam_report\",\"confidence\":0.9}" >/dev/null
+docker compose exec -T redpanda rpk topic produce fast_decisions <<<"{\"schema_version\":\"1.0.0\",\"category\":\"scam_report\",\"confidence\":0.9}" >/dev/null
 sleep 5
 check_eq "fault:malformed decision → no alert row" "0" \
   "$(chq "SELECT count() FROM udp.alerts WHERE event_id = ''")"
+
+# notify: a model payload with an empty decision_id must be dropped, not alerted.
+docker compose exec -T redpanda rpk topic produce model_decisions <<<"{\"schema_version\":\"1.0.0\",\"decision_id\":\"\",\"event_id\":\"smoke-empty-decision\",\"escalate_probability\":0.99,\"scam_probability\":0.99,\"degraded\":false}" >/dev/null
+sleep 5
+check_eq "fault:empty model decision_id → no alert row" "0" \
+  "$(chq "SELECT count() FROM udp.alerts WHERE event_id = 'smoke-empty-decision'")"
 
 if [[ "$MODE" == "--mock" ]]; then
   # decide: a 200 whose answers shape is unreadable must degrade the row, not
@@ -293,8 +340,9 @@ check_ge "notifier:delivered alerts ≥1 (limit exercised)" "$ALERTS_DELIVERED" 
 check_eq "notifier:delivered alerts missing from receiver" "0" "$MISSING"
 PER_MIN_MAX=$(chq "SELECT max(n) FROM (SELECT toStartOfMinute(created_at) m, count() n
                     FROM udp.alerts WHERE NOT suppressed GROUP BY m)")
-check_le "notifier:max delivered in one minute (limit 10)" "$PER_MIN_MAX" "10"
-# S9's trigger latency: decided_at (event-embedded) → receiver receipt.
+ALERT_LIMIT="${ALERT_RATE_LIMIT_PER_MIN:-10}"
+check_le "notifier:max delivered in one minute (limit ${ALERT_LIMIT})" "$PER_MIN_MAX" "$ALERT_LIMIT"
+# Trigger latency: decided_at (event-embedded) to receiver receipt.
 TRIGGER_P95=$(RECEIPTS="$RECEIPTS_JSON" uv run python -c '
 import datetime as dt, json, os
 
@@ -316,6 +364,16 @@ fi
 echo "alerts: total=$ALERTS_TOTAL delivered=$ALERTS_DELIVERED receiver_receipts=$RECEIPT_N trigger_p95=${TRIGGER_P95}s"
 
 echo "--- 8/8 CDC: 2 mutations through the conduit bus"
+# cdc: one malformed pg_changes record must go to the DLQ, not pin the offset.
+docker compose exec -T redpanda rpk topic produce pg_changes <<<"not a cdc record" >/dev/null
+CDC_DLQ=0
+for _ in $(seq 1 20); do
+  CDC_DLQ=$(topic_count pg_changes_dlq)
+  if (( CDC_DLQ >= 1 )); then break; fi
+  sleep 0.5
+done
+check_eq "cdc:malformed record → pg_changes_dlq" "1" "$CDC_DLQ"
+
 CDC_BEFORE=$(chq 'SELECT count() FROM udp.app_users_cdc')
 uv run udp-pg-mutate --mode mix --count 2 --seed 8 >/dev/null
 CDC_OK=0

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# S8 chaos + load acceptance run — THE local acceptance gate (real model).
+# Chaos and load acceptance run: the local acceptance gate (real model).
 #
 #   tests/integration/chaos.sh
 #
-# Local-only (needs the S0 .venv model runtime + the RX 6600 XT): real Laya
+# Local-only (needs the project .venv model runtime and the RX 6600 XT): real Laya
 # model container answering flagged tickets, mock alert-receiver recording
 # deliveries. NOT part of CI — the CI smoke job is mock-only by design.
 #
@@ -26,14 +26,27 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
+# Use the same thresholds and rate limit as the compose stack.
+if [[ -f .env ]]; then
+  set -a
+  source .env
+  set +a
+elif [[ -f .env.example ]]; then
+  set -a
+  source .env.example
+  set +a
+fi
+
 RATE=100
 COUNT=60000          # 600 s at 100 ev/s
 SEED=7
 KILL_AT_S=180        # minute 3 of the run
 COMPOSE=(docker compose -f docker-compose.yaml -f compose.mock.yaml -f tests/integration/chaos.compose.yaml --profile model)
-RSS_LOG=/tmp/opencode/chaos-rss.log
-LAG_LOG=/tmp/opencode/chaos-decide-lag.log
-SUMMARY=/tmp/opencode/chaos-summary.txt
+WORK_DIR="${TMPDIR:-/tmp}/opencode"
+mkdir -p "$WORK_DIR"
+RSS_LOG="$WORK_DIR/chaos-rss.log"
+LAG_LOG="$WORK_DIR/chaos-decide-lag.log"
+SUMMARY="$WORK_DIR/chaos-summary.txt"
 
 # ---------- helpers (same conventions as smoke.sh) ---------------------------
 
@@ -47,6 +60,11 @@ group_lag() {
   lag=$(docker compose exec -T redpanda rpk group describe "$1" 2>/dev/null \
     | awk '/^TOTAL-LAG/ { print $2 }' | tail -1)
   echo "${lag:-999999}"
+}
+
+topic_partitions() {
+  docker compose exec -T redpanda rpk topic describe "$1" -p 2>/dev/null \
+    | awk 'NR > 1 { n++ } END { print n + 0 }'
 }
 wait_all_lags_below() { # threshold timeout_s
   local threshold="$1" timeout="$2" start now ok lag
@@ -132,7 +150,7 @@ check_le() { if awk -v a="$2" -v b="$3" 'BEGIN { exit !(a <= b) }'; then pass "$
 
 GROUPS=(udp-ingest udp-decide udp-notify-fast udp-notify-model)
 
-echo "=== S8 chaos + load (steady $COUNT @ $RATE ev/s, kill@${KILL_AT_S}s, real model) ==="
+echo "=== chaos + load (steady $COUNT @ $RATE ev/s, kill@${KILL_AT_S}s, real model) ==="
 echo "--- 1/5 clean slate + real-model stack up"
 docker compose -f docker-compose.yaml -f compose.mock.yaml --profile model down -v >/dev/null 2>&1 || true
 # --build: the alert-receiver image bakes tests/mocks/mock_alert_receiver.py.
@@ -152,6 +170,7 @@ curl -fsS --max-time 30 -X POST http://127.0.0.1:8082/v1/systemone \
   -d '{"model":"laya","state":"warmup ping","questions":{"escalate_now":{"type":"noul"},"category":{"type":"choice","options":["complaint","scam_report","billing","bug","access","feature_request"]}}}' \
   >/dev/null || { echo "model warmup call failed"; exit 1; }
 echo "model container healthy (host eval port 8082, warmup OK)"
+check_eq "topics:pg_changes single partition" "1" "$(topic_partitions pg_changes)"
 
 echo "--- 2/5 RSS sampler (every 30s, informational → $RSS_LOG)"
 : >"$RSS_LOG"
@@ -288,6 +307,8 @@ FAST_MIN=$(awk -v p="$PRODUCED" 'BEGIN { printf "%d", p * 0.90 }')
 MODEL_MIN=$(awk -v p="$PRODUCED" 'BEGIN { printf "%d", p * 0.03 }')
 check_ge "chaos:fast_decisions distinct ≥ 0.90×produced" "$FAST_DISTINCT" "$FAST_MIN"
 check_ge "chaos:model_decisions distinct ≥ 0.03×produced" "$MODEL_DISTINCT" "$MODEL_MIN"
+check_eq "chaos:model decision_id derived from event_id" "0" \
+  "$(chq "SELECT count() FROM udp.model_decisions WHERE decision_id != concat('model:', event_id)")"
 
 check_eq "chaos:decision coverage misses" "0" \
   "$(chq "SELECT count() FROM (SELECT DISTINCT event_id FROM udp.tickets_raw) t
@@ -303,9 +324,12 @@ check_le "chaos:degraded ≤ 0.5% of model rows (whole run)" "$DEGRADED" "$DEGRA
 
 ALERT_DUPES=$(chq 'SELECT count() - uniqExact(decision_id) FROM udp.alerts')
 check_eq "chaos:alerts dedupe (rows == distinct decision_id)" "0" "$ALERT_DUPES"
+check_eq "chaos:alerts one per event (rows == distinct event_id)" "0" \
+  "$(chq 'SELECT count() - uniqExact(event_id) FROM udp.alerts')"
 PER_MIN_MAX=$(chq "SELECT max(n) FROM (SELECT toStartOfMinute(created_at) m, count() n
                     FROM udp.alerts WHERE NOT suppressed GROUP BY m)")
-check_le "chaos:rate limit — max delivered alerts/minute ≤ 10" "$PER_MIN_MAX" "10"
+ALERT_LIMIT="${ALERT_RATE_LIMIT_PER_MIN:-10}"
+check_le "chaos:rate limit — max delivered alerts/minute ≤ ${ALERT_LIMIT}" "$PER_MIN_MAX" "$ALERT_LIMIT"
 
 echo "--- 5/5 trigger latency (receiver receipts)"
 RECEIPTS_JSON=$(docker compose exec -T alert-receiver python -c \

@@ -1,4 +1,4 @@
-"""Decision-quality / latency eval for the Laya model server (S5).
+"""Decision-quality and latency eval for the Laya model server.
 
 Generates labeled synthetic tickets (``category_hint`` = ground truth, never
 published on the wire), drives them through the RUNNING model server over

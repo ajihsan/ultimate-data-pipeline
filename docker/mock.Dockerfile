@@ -1,5 +1,5 @@
-# Mock Jev /v1/systemone server (S4 verification stand-in for the S5 Laya
-# server). Dependencies are baked at build time — no network access at runtime.
+# Mock Jev /v1/systemone server: a stand-in for the Laya server.
+# Dependencies are baked at build time; the container needs no network.
 FROM python:3.12-slim
 
 RUN pip install --no-cache-dir fastapi==0.143.0 uvicorn==0.54.0

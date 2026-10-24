@@ -1,28 +1,20 @@
-# S4 — decide pipeline: topic `tickets` → cascade decision path.
+# decide pipeline: topic `tickets` → cascade decision path.
 #
-# FAST-PATH RULE TABLE — deterministic FIRST-MATCH priority, evaluated in the
-# order below on the lowercased ticket text (substring match). docs/rules.md
-# is the human-readable copy.
-#   rule 1: scam_report     conf 0.95 keywords: scam, fraud, phishing, fake, "charged twice", malware
-#   rule 2: billing         conf 0.90 keywords: invoice, charged, refund, subscription, declined, renewal, billing
-#   rule 3: bug             conf 0.90 keywords: crash, error, broken, "white screen", fail, stale, unreadable, duplicate, truncat, "null pointer"
-#   rule 4: access          conf 0.90 keywords: login, password, locked, 2fa, sso, expired, invite, session
-#   rule 5: feature_request conf 0.85 keywords: feature, request, "would be nice", suggest, "would love", "please add", "any chance", "it would help", "can we get"
-#   rule 6: complaint       conf 0.85 keywords: angry, terrible, worst, cancel, unacceptable, "not happy", "nothing loads", redesign
-#   rule 7: (no category → flag)   conf 0.40 ambiguous heuristics — garbled text (5+ consonant run), >40% caps, >=5 "!" or "?", <12 chars → FLAG for model
-#   rule 8: (no category → flag)   conf 0.45 no match → FLAG for model
+# FAST PATH — deterministic first-match rule table. The mapping below is the
+# source of truth; docs/rules.md is the human-readable mirror, and
+# tests/test_rules_doc.py pins the two together.
 #
 # Confident verdicts (rules 1-6) build a FastDecision and fan out to
 # udp.fast_decisions + topic `fast_decisions`; the model is never touched.
-# Flagged verdicts (rules 7-8) POST the /v1/systemone contract to
-# MODEL_ENDPOINT_URL. EVERY flagged event yields a ModelDecision row: the
-# endpoint's answers on success, or a degraded fallback (escalate/scam = 0,
-# degraded = true) on any failure — transport, timeout, retries exhausted, or
-# a 200 whose answers shape is unreadable — counted in `model_degraded_total`.
+# Flagged verdicts (rules 7-8) POST /v1/systemone to MODEL_ENDPOINT_URL.
+# EVERY flagged event yields a ModelDecision row: the endpoint's answers on
+# success, or a degraded fallback (escalate/scam = 0, degraded = true) on any
+# failure — transport, timeout, retries exhausted, or a 200 whose answers
+# shape is unreadable — counted in `model_degraded_total`. The decision_id is
+# derived from the ticket event_id (`model:<event_id>`), so a crash replay
+# reuses the same alert dedupe key.
 #
-# S5b concurrency (measured; math at each knob): threads 4, checkpoint_limit
-# 1024, http timeout 1500ms.
-#
+# Concurrency (measured): threads 4, checkpoint_limit 1024, HTTP timeout 1500ms.
 # Health: GET :4195/ping; metrics: :4195/metrics.
 
 http:
@@ -45,14 +37,15 @@ input:
 
 pipeline:
   # 4 workers cap concurrent model calls at 4 → server cohorts ≤ 4 states →
-  # worst in-load service ≈ 310ms (30ms base + 4 × 70ms/state, S5-measured) —
+  # worst in-load service ≈ 310ms (30ms base + 4 × 70ms/state, measured) —
   # inside the 1500ms timeout. The 12-thread default fired 12-30 concurrent
   # calls → 167/348 burst flags degraded.
   threads: 4
   processors:
-    # Classify (rule table above). Tickets with no usable event_id/text are
-    # null-flagged: they match no output case and drop (ingest already DLQ'd
-    # a copy); the catch normalizes unparseable tickets the same way.
+    # Classify (rule table above). Tickets that fail the required-field
+    # checks are null-flagged: they match no output case and drop (ingest
+    # already DLQ'd a copy); the catch normalizes unparseable tickets the same
+    # way. These checks mirror connect/ingest.yaml and src/udp/schemas.py.
     - try:
         - mapping: |
             # The kafka_franz input auto-parses JSON, so `this` is the parsed
@@ -61,6 +54,17 @@ pipeline:
             root = this
             let eid = root.event_id | ""
             let text = root.text | ""
+            let valid = match {
+              $eid == "" => false
+              $text == "" => false
+              (root.schema_version | "") == "" => false
+              (root.user_id | "") == "" => false
+              (root.created_at.type() != "string") => false
+              root.created_at.ts_format("2006-01-02 15:04:05.999", "UTC").catch(null) == null => false
+              (root.ingested_at.type() != "string") => false
+              root.ingested_at.ts_format("2006-01-02 15:04:05.999", "UTC").catch(null) == null => false
+              _ => true
+            }
             let low = $text.lowercase()
             # Rule 7 inputs (applied only after rules 1-6 miss).
             let bangs = $low.re_find_all("[!?]").length()
@@ -86,7 +90,7 @@ pipeline:
               _ => null
             }
             root.fast_flagged = match {
-              $eid == "" || $text == "" => null
+              $valid == false => null
               $category != null => false
               _ => true
             }
@@ -118,7 +122,7 @@ pipeline:
                   "category": this.fast_category,
                   "confidence": this.fast_confidence,
                   "decided_at": now(),
-                  "schema_version": this.schema_version | "",
+                  "schema_version": this.schema_version,
                 }
         # ── Flagged path: model call, or degraded fallback on ANY failure. ──
         - check: 'this.fast_flagged == true'
@@ -126,11 +130,11 @@ pipeline:
             # Stash ticket fields in metadata, then build the /v1/systemone
             # request (the http processor replaces content with the response).
             - mapping: |
-                meta ticket_event_id = this.event_id | ""
-                meta ticket_schema_version = this.schema_version | ""
+                meta ticket_event_id = this.event_id
+                meta ticket_schema_version = this.schema_version
                 root = {
                   "model": "laya",
-                  "state": this.text | "",
+                  "state": this.text,
                   "questions": {
                     "escalate_now": {"type": "noul"},
                     "category": {"type": "choice", "options": ["complaint", "scam_report", "billing", "bug", "access", "feature_request"]}
@@ -144,7 +148,8 @@ pipeline:
                       Content-Type: application/json
                     # ≈4.8× the worst cohort-4 service; timeouts are
                     # unrecoverable (retries fire only on 429/503) so headroom
-                    # beats tightness.
+                    # beats tightness. The server's Retry-After header is
+                    # advisory; this processor uses retry_period.
                     timeout: 1500ms
                     retries: 1
                     backoff_on:
@@ -180,7 +185,9 @@ pipeline:
                 }
                 root = {
                   "event_id": meta("ticket_event_id"),
-                  "decision_id": uuid_v4(),
+                  # Deterministic from the ticket, so a crash replay reuses
+                  # the alert dedupe key. The fast path uses the same pattern.
+                  "decision_id": "model:" + meta("ticket_event_id"),
                   "question_type": "choice",
                   "answers": $answers,
                   # .number() coerces the response's json.Number values to
@@ -202,7 +209,7 @@ pipeline:
 output:
   switch:
     retry_until_success: true # sink outages retry instead of losing decisions
-    strict_mode: false # unparseable tickets (flagged by ingest) drop here
+    strict_mode: false # invalid tickets are null-flagged and drop here
     cases:
       # FastDecision records → udp.fast_decisions + topic `fast_decisions`.
       - check: 'this.category != null'

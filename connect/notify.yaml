@@ -1,38 +1,29 @@
-# S6 — notify pipeline: fast_decisions + model_decisions → udp.alerts + delivery.
+# notify pipeline: fast_decisions + model_decisions → udp.alerts + delivery.
 #
-# QUALIFYING RULE TABLE — a decision becomes an alert iff:
-#   model: escalate_probability ≥ THRESHOLD_ESCALATE_P (default 0.75) OR
-#          scam_probability ≥ THRESHOLD_SCAM_P (default 0.35)
-#   fast:  category == scam_report AND confidence ≥ 0.85
-#   degraded model rows NEVER qualify (p = 0 → below both thresholds).
-#   Non-qualifying decisions produce NO alert row at all.
+# QUALIFY — model: escalate_probability ≥ THRESHOLD_ESCALATE_P (default 0.75)
+# or scam_probability ≥ THRESHOLD_SCAM_P (default 0.35). Fast: category ==
+# scam_report and confidence ≥ 0.85. Degraded model rows never qualify.
 #
-# DEDUPE — keyed by decision_id (the fast path has none → synthesized as
-# fast:<event_id>). The alerts row IS the dedupe record: count() on udp.alerts
-# WHERE decision_id = ?; a hit → drop. Replay-safe across SIGKILL/restart
-# (kafka_franz re-delivers ~10s of uncommitted traffic). No RAM cache: a
-# cache+TTL dedupe would lie after a failed insert (key set, row not written →
-# the redelivered copy is dropped and the alert lost). Exactly-once per
-# decision_id, barring co-batched duplicates from an upstream producer retry.
+# DEDUPE — the alerts row is the dedupe record: count() on udp.alerts WHERE
+# decision_id = ?; a hit drops the message. The fast path uses
+# fast:<event_id>; the model path uses model:<event_id>. Both keys come from
+# the ticket, so a crash replay reuses the key. No RAM dedupe cache: a cache
+# hit after a failed insert would lose the alert.
 #
 # RATE LIMIT — ALERT_RATE_LIMIT_PER_MIN (default 10) delivered alerts per
-# epoch minute, DROP-AND-RECORD: over-limit alerts still land as
-# suppressed=true rows (+ notify_suppressed_total). A ttlru cache holds the
-# minute counter (key alert-count-<epoch-minute>); threads 1 serializes
-# counter + dedupe; counter failure fails open (never blocks rows); a restart
-# mid-minute re-arms the window (durable dedupe still prevents double rows).
+# epoch minute. Over-limit alerts are recorded with suppressed=true. A ttlru
+# cache holds the minute counter; threads 1 serializes counter + dedupe; a
+# counter failure fails open; a restart re-arms the window (durable dedupe
+# still prevents duplicate rows).
 #
-# DELIVERY — the alerts row is ALWAYS written (sql_insert, batching count:1,
-# strict_mode nacks unfinished work). NOTIFY_PROVIDER (comma list) fans out:
-#   log (DEFAULT, no HTTP) | mock (POST ALERT_RECEIVER_URL) | telegram |
-#   discord (POST bot API / webhook). Failed POSTs retry (3s, 2 retries,
-#   backoff 429/503) then log notify_delivery_failed_total — the row still
-#   lands. Delivery is at-least-once (a CH outage between POST and insert can
-#   re-notify on redelivery). The channel column records
-#   telegram | discord | telegram,discord | mock.
+# DELIVERY — the alerts row is always written. NOTIFY_PROVIDER (comma list)
+# fans out: log (default, no HTTP) | mock | telegram | discord. Failed POSTs
+# retry (3s, 2 retries, backoff 429/503), then log
+# notify_delivery_failed_total; the row still lands. Delivery is at-least-once.
+# The channel column records log | mock | telegram | discord | telegram,discord.
+# One worker also serializes delivery, so a slow provider delays later alerts.
 #
-# GO-LIVE: Telegram bot via @BotFather + chat id, or Discord webhook; set
-# TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / DISCORD_WEBHOOK_URL in .env.
+# Invalid decisions are dropped, logged, and counted in notify_dropped_total.
 # Health: GET :4195/ping; metrics: :4195/metrics.
 
 http:
@@ -69,18 +60,19 @@ pipeline:
   # One worker serializes the rate counter and the dedupe check (see header).
   threads: 1
   processors:
-    # Normalize both decision shapes into one evaluation record; the fast path
-    # gets a synthesized fast:<event_id> dedupe key. Unparseable bytes and
-    # payloads with neither decision_id nor event_id throw into the catch
-    # below and are dropped with a WARN log (the decisions tables hold the
-    # parsed copies).
+    # Normalize both decision shapes into one evaluation record. The fast path
+    # gets a synthesized fast:<event_id> dedupe key. Invalid payloads (non-object,
+    # empty IDs, or neither shape) throw into the catch below; the decisions
+    # tables still hold the parsed copies.
     - try:
         - mapping: |
             root = match {
               this.type() != "object" => throw("not a JSON object"),
+              (this.schema_version | "") == "" => throw("decision has an empty schema_version"),
+              this.decision_id != null && ((this.decision_id | "") == "" || (this.event_id | "") == "") => throw("model decision has an empty decision_id or event_id"),
               this.decision_id != null => {
                 "source": "model",
-                "event_id": this.event_id | "",
+                "event_id": this.event_id,
                 "decision_id": this.decision_id,
                 "category": null,
                 "confidence": null,
@@ -88,29 +80,32 @@ pipeline:
                 "scam_probability": this.scam_probability | 0.0,
                 "degraded": this.degraded | false,
                 "decided_at": this.decided_at | now(),
-                "schema_version": this.schema_version | "",
+                "schema_version": this.schema_version,
               }
-              (this.event_id | "") != "" => {
+              (this.event_id | "") != "" && this.category != null => {
                 "source": "fast",
-                "event_id": this.event_id | "",
-                "decision_id": "fast:" + (this.event_id | ""),
-                "category": this.category | "",
+                "event_id": this.event_id,
+                "decision_id": "fast:" + this.event_id,
+                "category": this.category,
                 "confidence": this.confidence | 0.0,
                 "escalate_probability": null,
                 "scam_probability": null,
                 "degraded": false,
                 "decided_at": this.decided_at | now(),
-                "schema_version": this.schema_version | "",
+                "schema_version": this.schema_version,
               }
-              _ => throw("no decision_id and no event_id"),
+              _ => throw("not a model decision and not a fast decision"),
             }
     - catch:
+        - metric:
+            type: counter
+            name: notify_dropped_total
         - log:
             level: WARN
-            message: "notify: malformed decision dropped (${! error() })"
+            message: "notify: invalid decision dropped (${! error() })"
         - mapping: 'root = deleted()'
     # Qualifying rule table (header) — thresholds arrive from the environment
-    # at config parse time (compose passes THRESHOLD_*; S5-final values).
+    # at config parse time (compose passes THRESHOLD_*; final values).
     - mapping: |
         root = this
         root.qualifies = match {
@@ -178,7 +173,8 @@ pipeline:
           $providers.contains("telegram") && $providers.contains("discord") => "telegram,discord"
           $providers.contains("telegram") => "telegram"
           $providers.contains("discord") => "discord"
-          _ => "mock"
+          $providers.contains("mock") => "mock"
+          _ => "log"
         }
         root.rate_count = $count
     - switch:

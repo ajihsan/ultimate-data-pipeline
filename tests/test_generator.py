@@ -8,10 +8,12 @@ import pytest
 
 from udp.generator import tickets
 from udp.generator.tickets import (
+    DEFAULT_BOOTSTRAP,
     MAX_FLAGGED_PER_BURST,
     BurstProfile,
     GeneratorConfig,
     TicketGenerator,
+    default_bootstrap,
     main,
 )
 from udp.schemas import CATEGORIES, Ticket
@@ -123,9 +125,9 @@ def test_ambiguous_flagged_hint_is_none() -> None:
     assert all(e.category_hint in CATEGORIES for e in hinted)
 
 
-def test_burst_profile_budget_bound_assert() -> None:
+def test_burst_profile_budget_bound() -> None:
     """Profiles cannot declare a flagged budget above the model-capacity bound."""
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="exceeds burst capacity"):
         BurstProfile(
             name="overbudget",
             duration_s=60.0,
@@ -135,12 +137,56 @@ def test_burst_profile_budget_bound_assert() -> None:
         )
 
 
+def test_default_bootstrap_reads_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REDPANDA_BOOTSTRAP overrides the localhost default."""
+    monkeypatch.setenv("REDPANDA_BOOTSTRAP", "broker:19092")
+    assert default_bootstrap() == "broker:19092"
+    monkeypatch.delenv("REDPANDA_BOOTSTRAP")
+    assert default_bootstrap() == DEFAULT_BOOTSTRAP
+
+
+def test_cli_bootstrap_overrides_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--bootstrap wins over the environment and reaches the config."""
+    monkeypatch.setenv("REDPANDA_BOOTSTRAP", "env:9092")
+    captured: list[GeneratorConfig] = []
+
+    def fake_run(config: GeneratorConfig, *, dry_run: bool = False) -> int:
+        captured.append(config)
+        return 0
+
+    monkeypatch.setattr(tickets, "run", fake_run)
+    args = tickets.build_generate_parser().parse_args(
+        ["--dry-run", "--count", "1", "--bootstrap", "cli:9092"]
+    )
+    assert tickets.run_from_namespace(args) == 0
+    assert captured[0].bootstrap == "cli:9092"
+
+
+def test_run_fails_when_flush_reports_undelivered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed delivery makes the generator exit nonzero."""
+
+    class FakePublisher:
+        delivery_errors = 0
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def publish(self, _ticket: Ticket) -> None:
+            pass
+
+        def flush(self, _timeout: float = 10.0) -> int:
+            return 1
+
+    monkeypatch.setattr(tickets, "TicketPublisher", FakePublisher)
+    assert tickets.run(GeneratorConfig(seed=1, count=1, rate=1000)) == 1
+
+
 def test_dry_run_cli_prints_valid_tickets(capsys: pytest.CaptureFixture[str]) -> None:
     """`udp-generate --dry-run --seed 42 --count 5` prints 5 valid Tickets."""
     code = main(["--dry-run", "--seed", "42", "--count", "5", "--rate", "100000"])
     assert code == 0
     lines = capsys.readouterr().out.strip().splitlines()
-    assert len(lines) >= 5
+    assert len(lines) == 5
     parsed: list[Ticket] = []
     for line in lines:
         payload: dict[str, Any] = json.loads(line)

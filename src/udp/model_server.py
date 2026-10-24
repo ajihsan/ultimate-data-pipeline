@@ -1,4 +1,4 @@
-"""Real Laya model server for the decide pipeline (S5).
+"""Real Laya model server for the decide pipeline.
 
 ``POST /v1/systemone`` (``{"model","state","questions":{<name>:{"type":…}}}``)
 → ``{"answers":{…}}`` — the exact wire contract decide.yaml sends and
@@ -58,16 +58,17 @@ DEFAULT_HOST = "127.0.0.1"  # decide reaches us via host.docker.internal
 DEFAULT_PORT = 8081  # docker-compose points MODEL_ENDPOINT_URL here
 DEFAULT_DEVICE = "cuda"  # bf16 autocast is laya's CUDA default for this checkpoint
 
-# Queue sized so worst-case queueing stays far under decide.yaml's 1500ms
-# endpoint timeout (~8 × 64ms ≈ 512ms; the 503 backpressure keeps it bounded).
-DEFAULT_MAX_QUEUE = 64
+# Queue of 16 bounds admission. With batch 8 and ~573ms per cohort, the
+# worst-case queue is about 1.1s, below decide.yaml's 1500ms timeout. The 503
+# backpressure keeps the queue bounded.
+DEFAULT_MAX_QUEUE = 16
 
 # States collated into one predict_batch call (≈573ms on this GPU); the
 # straggler wait before running a partially-filled batch.
 DEFAULT_MAX_BATCH = 8
 DEFAULT_COALESCE_MS = 10.0
 
-RETRY_AFTER_S = "1"  # RFC 7231 delay-seconds is an integer
+RETRY_AFTER_S = "1"  # RFC 7231 delay-seconds is an integer; clients may ignore it
 
 #: One queued inference request: ``(state, questions, future)``.
 _Job = tuple[str, dict[str, dict[str, Any]], "Future[dict[str, Any]]"]
@@ -331,7 +332,12 @@ def create_app(
         with backoff); 500 on inference failure. ``Server-Timing:
         inference;dur=`` covers queue wait + batched forward pass.
         """
-        assert gate is not None, "gate must be built by the lifespan"
+        if gate is None:
+            return JSONResponse(
+                status_code=503,
+                headers={"Retry-After": RETRY_AFTER_S},
+                content={"detail": "model server starting"},
+            )
         wire_questions = {qid: q.model_dump() for qid, q in req.questions.items()}
         laya_questions, unsupported = to_laya_questions(wire_questions)
         started = time.perf_counter()

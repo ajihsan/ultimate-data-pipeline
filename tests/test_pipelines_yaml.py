@@ -1,8 +1,8 @@
 """Every pipeline config must remain parseable YAML.
 
-Bloblang mappings live inside YAML block scalars, so a bad indent can
-silently change what a pipeline executes; the compose `config` mount would
-fail at startup instead — catch it in CI first.
+Bloblang mappings live inside YAML block scalars, so a bad indent can change
+what a pipeline executes. This test catches YAML structure errors. The smoke
+job catches Bloblang syntax and runtime errors.
 """
 
 from pathlib import Path

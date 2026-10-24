@@ -1,4 +1,4 @@
-"""Deterministic Postgres mutation driver for the S7 conduit bus CDC pipeline.
+"""Deterministic Postgres mutation driver for the conduit bus CDC pipeline.
 
 Applies INSERT / UPDATE / DELETE operations to ``app_users`` so the
 postgres → Redpanda (``pg_changes``) → ClickHouse (``app_users_cdc``) path can
@@ -144,7 +144,7 @@ def build_parser(add_help: bool = True) -> argparse.ArgumentParser:
         add_help=add_help,
         description=(
             "Apply deterministic mutations to postgres app_users "
-            "(S7 CDC verification driver: insert|update|delete|mix)."
+            "(CDC verification driver: insert|update|delete|mix)."
         ),
     )
     parser.add_argument(

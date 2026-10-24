@@ -1,16 +1,18 @@
 """Typed domain contracts for the realtime ticket pipeline.
 
-Every payload that crosses a Kafka topic or lands in a ClickHouse row is one of
-the four models in this module plus the mapping-added ``answers_json``
-serialization field on model_decisions (real topic payloads are therefore not
-bare-model-validatable), and each carries a ``schema_version`` envelope
-field so the wire format can evolve without silently breaking consumers.
+``Ticket`` is the only model the runtime validates. The generator produces it,
+and the ingest pipeline mirrors its required fields in Bloblang. The other
+three models (FastDecision, ModelDecision, AlertEvent) are contract fixtures:
+the Connect pipelines build the same shapes as JSON, and the tests validate
+these examples. Runtime code does not import them.
 
-Latency measurement contract: producers set ``Ticket.ingested_at`` when the
-ticket enters the stream, and deciders stamp ``decided_at`` on their decision
-payloads. End-to-end latency is measured as ``p95 = decided_at - ingested_at``
-across the fast path and the model path alike, so keep both clocks producer-side
-and timezone-aware.
+Every payload carries a ``schema_version`` envelope field. ``model_decisions``
+adds the mapping-serialized ``answers_json`` field, so a real topic payload is
+not bare-model-validatable.
+
+Latency contract: producers set ``Ticket.ingested_at`` when the ticket enters
+the stream, and deciders stamp ``decided_at``. End-to-end p95 is
+``decided_at - ingested_at``. Keep both clocks producer-side and aware.
 """
 
 from __future__ import annotations
@@ -27,12 +29,11 @@ Category = Literal["complaint", "scam_report", "billing", "bug", "access", "feat
 """Ticket categories the rule fast path can assign."""
 
 QuestionType = Literal["choice", "score", "noul"]
-"""Question types of the ``POST /v1/systemone`` decision head (S0 contract)."""
+"""Question types of the ``POST /v1/systemone`` decision head."""
 
-Channel = str
-"""Alert delivery channel as recorded in udp.alerts: ``telegram``,
-``discord``, the fan-out list ``telegram,discord``, or ``mock`` (the log-mode
-value — alerts are ClickHouse-only rows, never a validated wire payload)."""
+Channel = Literal["log", "mock", "telegram", "discord", "telegram,discord"]
+"""Alert delivery channel as recorded in udp.alerts. The value names the real
+sink; ``log`` means the alert was logged and no HTTP request was made."""
 
 CATEGORIES: tuple[Category, ...] = (
     "complaint",
@@ -126,9 +127,7 @@ class Ticket(DomainEnvelope):
     strips it before publishing (see ``WIRE_EXCLUDED_FIELDS``) while keeping it
     in ``--dry-run`` output for testability.
 
-    Latency measurement contract: ``ingested_at`` is set producer-side at the
-    moment the ticket enters the stream; p95 latency is measured end-to-end as
-    ``p95 = decided_at - ingested_at``.
+    ``ingested_at`` is set producer-side when the ticket enters the stream.
 
     Attributes:
         event_id: Inherited correlation key.
@@ -141,7 +140,6 @@ class Ticket(DomainEnvelope):
         created_at: Producer-side moment the user created the ticket; may lag
             ``ingested_at`` by a small backlog jitter.
         ingested_at: Producer-side moment the ticket entered the stream.
-            Latency measurement contract: ``p95 = decided_at - ingested_at``.
     """
 
     text: str = Field(min_length=1, description="Verbatim user-submitted ticket text.")
@@ -161,10 +159,7 @@ class Ticket(DomainEnvelope):
         description=("Producer-side moment the user created the ticket (UTC, aware)."),
     )
     ingested_at: datetime = Field(
-        description=(
-            "Producer-side moment the ticket entered the stream (UTC, aware). "
-            "Latency measurement contract: p95 = decided_at - ingested_at."
-        ),
+        description="Producer-side moment the ticket entered the stream (UTC, aware).",
     )
 
     model_config = ConfigDict(
@@ -219,9 +214,7 @@ class FastDecision(DomainEnvelope):
     pattern certainty and never calls the model. ``confidence`` carries the
     rule's certainty in ``[0, 1]`` so the cascade can be tuned and audited.
 
-    Latency measurement contract: ``decided_at`` is stamped when the rule
-    verdict is recorded; p95 latency is measured end-to-end as
-    ``p95 = decided_at - ingested_at``.
+    ``decided_at`` is stamped when the rule verdict is recorded.
 
     Attributes:
         event_id: Inherited correlation key (same ticket as the decision).
@@ -229,7 +222,6 @@ class FastDecision(DomainEnvelope):
         category: Rule-assigned category, one of ``CATEGORIES``.
         confidence: Rule certainty in ``[0, 1]``.
         decided_at: Moment the fast path recorded its verdict (UTC, aware).
-            Latency measurement contract: ``p95 = decided_at - ingested_at``.
     """
 
     category: Category = Field(description="Rule-assigned ticket category.")
@@ -239,10 +231,7 @@ class FastDecision(DomainEnvelope):
         description="Rule certainty in [0, 1] derived from pattern match strength.",
     )
     decided_at: datetime = Field(
-        description=(
-            "Producer-side moment the fast-path verdict was recorded (UTC, "
-            "aware). Latency measurement contract: p95 = decided_at - ingested_at."
-        ),
+        description="Producer-side moment the fast-path verdict was recorded (UTC, aware).",
     )
 
     model_config = ConfigDict(
@@ -270,36 +259,34 @@ class FastDecision(DomainEnvelope):
 class ModelDecision(DomainEnvelope):
     """Laya decision-model verdict for a flagged ticket.
 
-    Emitted by the model stage for every ticket the fast path flags. The raw
-    ``/v1/systemone`` answers block is preserved verbatim in ``answers`` for
-    audit; ``decision_id`` is the per-verdict dedupe key used by the alert
-    trigger so one verdict produces at most one alert.
+    Emitted for every ticket the fast path flags. The raw ``/v1/systemone``
+    answers block is preserved verbatim in ``answers`` for audit.
+    ``decision_id`` comes from the ticket, so a replay produces the same alert
+    key and one ticket gets at most one model alert.
 
-    Latency measurement contract: ``decided_at`` is stamped when the model
-    verdict (or its degraded fallback) is recorded; p95 latency is measured
-    end-to-end as ``p95 = decided_at - ingested_at``.
+    Latency contract: ``decided_at`` is stamped when the model verdict (or its
+    degraded fallback) is recorded. End-to-end p95 is
+    ``decided_at - ingested_at``.
 
     Attributes:
         event_id: Inherited correlation key (same ticket as the decision).
         schema_version: Inherited wire schema version.
-        decision_id: Unique verdict identifier (uuid4 hex); the trigger
-            dedupe key — one decision, at most one alert.
-        question_type: Which ``/v1/systemone`` head answered: ``choice``,
-            ``score``, or ``noul``.
+        decision_id: Stable alert key, ``model:<event_id>``.
+        question_type: Primary decision head. The pipeline writes ``choice``
+            and also asks ``escalate_now``.
         answers: Raw ``/v1/systemone`` answers block, preserved verbatim.
         escalate_probability: Calibrated escalation probability in ``[0, 1]``.
         scam_probability: Calibrated scam probability in ``[0, 1]``.
         degraded: ``True`` when the model endpoint failed and a fallback
             verdict was recorded instead.
-        decided_at: Moment the verdict was recorded (UTC, aware). Latency
-            measurement contract: ``p95 = decided_at - ingested_at``.
+        decided_at: Moment the verdict was recorded (UTC, aware).
     """
 
     decision_id: str = Field(
-        description="Unique verdict identifier (uuid4 hex); the alert-trigger dedupe key.",
+        description="Stable alert dedupe key derived from the ticket: model:<event_id>.",
     )
     question_type: QuestionType = Field(
-        description="Which /v1/systemone head answered: choice, score, or noul.",
+        description="Primary head; the pipeline writes choice and also asks escalate_now.",
     )
     answers: dict[str, Any] = Field(
         description="Raw /v1/systemone answers block, preserved verbatim for audit.",
@@ -321,10 +308,7 @@ class ModelDecision(DomainEnvelope):
         ),
     )
     decided_at: datetime = Field(
-        description=(
-            "Producer-side moment the model verdict was recorded (UTC, aware). "
-            "Latency measurement contract: p95 = decided_at - ingested_at."
-        ),
+        description="Producer-side moment the model verdict was recorded (UTC, aware).",
     )
 
     model_config = ConfigDict(
@@ -333,7 +317,7 @@ class ModelDecision(DomainEnvelope):
             "examples": [
                 {
                     "event_id": "9f0c8b7e6d5a4940b2f1c3d4e5f60718",
-                    "decision_id": "4f9c2a8e7b3d4a1f8c6e2d5b0a9f7e34",
+                    "decision_id": "model:9f0c8b7e6d5a4940b2f1c3d4e5f60718",
                     "question_type": "choice",
                     "answers": {
                         "escalate_now": {"type": "noul", "noul": 0.91, "confidence": 0.91},
@@ -375,30 +359,30 @@ class ModelDecision(DomainEnvelope):
 
 
 class AlertEvent(DomainEnvelope):
-    """A notification dispatched (or rate-limit-suppressed) after a decision.
+    """One alert attempt after a decision.
 
-    One row per alert attempt, keyed by ``decision_id``; ``suppressed=True``
-    records rate-limit drops so the alert trail stays complete in ClickHouse
-    without hammering real chat channels.
+    ``suppressed=True`` records a rate-limit drop. ``suppressed=False`` means
+    the alert was not rate-limited; it does not prove delivery. Delivery
+    failures are counted in ``notify_delivery_failed_total``.
 
     Attributes:
         event_id: Inherited correlation key (same ticket as the alert).
         schema_version: Inherited wire schema version.
-        decision_id: The originating verdict id; joins to
-            ``ModelDecision.decision_id``.
-        channel: Delivery channel: ``telegram``, ``discord``, the fan-out list
-            ``telegram,discord``, or ``mock``.
+        decision_id: ``fast:<event_id>`` or ``model:<event_id>``; the dedupe
+            key and the join to the decision row.
+        channel: Delivery channel: ``log``, ``mock``, ``telegram``, ``discord``,
+            or the fan-out list ``telegram,discord``.
         suppressed: ``True`` when the rate limiter dropped the alert but the
             drop was still recorded.
         created_at: Producer-side moment the alert was attempted (UTC, aware).
     """
 
     decision_id: str = Field(
-        description="Originating ModelDecision.decision_id this alert belongs to.",
+        description="Originating decision key: fast:<event_id> or model:<event_id>.",
     )
     channel: Channel = Field(
         description=(
-            "Delivery channel: telegram, discord, the fan-out list telegram,discord, or mock."
+            "Delivery channel: log, mock, telegram, discord, or the fan-out list telegram,discord."
         ),
     )
     suppressed: bool = Field(
@@ -415,7 +399,7 @@ class AlertEvent(DomainEnvelope):
             "examples": [
                 {
                     "event_id": "9f0c8b7e6d5a4940b2f1c3d4e5f60718",
-                    "decision_id": "4f9c2a8e7b3d4a1f8c6e2d5b0a9f7e34",
+                    "decision_id": "model:9f0c8b7e6d5a4940b2f1c3d4e5f60718",
                     "channel": "mock",
                     "suppressed": False,
                     "created_at": "2026-10-13T09:12:43.812000+00:00",

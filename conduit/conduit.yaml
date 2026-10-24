@@ -1,22 +1,10 @@
-# S7 — conduit bus CDC pipeline: Postgres `app_users` → Redpanda `pg_changes`.
+# conduit bus CDC: postgres app_users -> redpanda pg_changes.
 #
-# Source: builtin postgres connector (bundled in conduit v0.20.0), snapshot
-# first (snapshotMode: initial) then logical-replication CDC
-# (cdcMode: logrepl). The slot/publication pair is the resume point: conduit
-# re-attaches to `conduitslot` after a restart (checkpoint lives in the
-# conduit-data badger volume), so snapshots never re-run. Postgres runs with
-# wal_level=logical (see the postgres command in docker-compose.yaml); the
-# connector creates the publication + slot on first boot and deletes them only
-# when the connector/pipeline is removed (logrepl.autoCleanup default true).
-#
-# Destination: builtin kafka connector → topic `pg_changes` (created by the
-# redpanda-init bootstrap). Records keep conduit's default opencdc/json
-# format: {"position","operation","metadata","key","payload":{"before","after"}}.
-# The connect `cdc` pipeline (docker-compose.yaml service `cdc`) lands these
-# into ClickHouse udp.app_users_cdc.
-#
-# Field names verified against the v0.20.0 docs (llms-full.txt, postgres
-# v0.14.2 / kafka v0.12.5) and empirically on the running stack, 2026-10-13.
+# Source: builtin postgres connector, snapshot then logical replication. The
+# slot/publication pair and the badger checkpoint resume without a new snapshot.
+# Destination: builtin kafka connector, OpenCDC json records; the `cdc` connect
+# pipeline lands them in ClickHouse. `pg_changes` must have one partition.
+# Field names verified against the v0.20.0 docs and the running stack, 2026-10-13.
 
 version: 2.2
 pipelines:

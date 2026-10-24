@@ -1,7 +1,8 @@
-"""Mock Jev /v1/systemone decision server (S4 pipeline verification).
+"""Mock Jev /v1/systemone decision server.
 
-The real Laya model server lands in S5; until then the decide pipeline is
-verified end-to-end against this canned, wire-compatible stand-in:
+The mock is used for CI and mock-mode runs. The real Laya server is
+``src/udp/model_server.py``. The decide pipeline runs end-to-end against this
+canned, wire-compatible stand-in:
 
     POST /v1/systemone  {"model","state","questions":{<name>:{"type":...}}}
       → {"answers":{<name>: <answer-per-type>}}
@@ -28,7 +29,7 @@ from typing import Any
 import uvicorn
 from fastapi import FastAPI
 
-NUA_P_YES = 0.92
+NOUL_P_YES = 0.92
 """Fixed noul answer: probability of ``yes`` for the escalate_now head."""
 
 CONFIDENCE = 0.87
@@ -100,9 +101,9 @@ def _answer_question(question: Mapping[str, Any], state: str) -> dict[str, Any]:
     """Answer one /v1/systemone question by its declared type."""
     qtype = question.get("type")
     if qtype == "noul":
-        return {"type": "noul", "noul": NUA_P_YES}
+        return {"type": "noul", "noul": NOUL_P_YES}
     if qtype == "score":
-        return {"type": "score", "scores": {"escalate": NUA_P_YES, "scam": 0.07}}
+        return {"type": "score", "scores": {"escalate": NOUL_P_YES, "scam": 0.07}}
     if qtype == "choice":
         options = list(question.get("options") or [])
         return _choice_answer(options, state)

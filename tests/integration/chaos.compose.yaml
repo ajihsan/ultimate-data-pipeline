@@ -1,4 +1,4 @@
-# S8 chaos-override: real-model stack WITH the mock alert receiver.
+# Chaos override: real-model stack with the mock alert receiver.
 #
 # compose.mock.yaml retargets the decide pipeline at the jev-mock server;
 # the chaos run needs the REAL model (compose profile `model`) while keeping

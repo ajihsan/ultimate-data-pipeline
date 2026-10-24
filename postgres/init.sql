@@ -1,6 +1,5 @@
--- CDC source table (S7 mirrors app_users to ClickHouse via Conduit).
--- Mounted into /docker-entrypoint-initdb.d, so it runs once on an empty
--- volume; the INSERT guard keeps it safe on any re-run.
+-- CDC source table. Mounted into /docker-entrypoint-initdb.d, so it runs once
+-- on an empty volume; the INSERT guard keeps it safe on a re-run.
 
 CREATE TABLE IF NOT EXISTS app_users (
     id         bigserial PRIMARY KEY,

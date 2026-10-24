@@ -1,4 +1,4 @@
-"""Mock alert receiver for the S6 notify pipeline (compose.mock.yaml).
+"""Mock alert receiver for the notify pipeline (compose.mock.yaml).
 
 Stands in for Telegram/Discord during verification: records every POSTed
 alert payload in memory so tests can join receiver receipts against

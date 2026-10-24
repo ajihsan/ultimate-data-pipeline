@@ -1,7 +1,6 @@
--- S3 landed tables (idempotent; mounted into /docker-entrypoint-initdb.d).
--- S7 owns the CDC mirror tables (clickhouse/cdc.sql) — do not add them here.
--- Timestamps are pinned to UTC so ingest stays deterministic regardless of
--- container/server timezone.
+-- Landed tables (idempotent; mounted into /docker-entrypoint-initdb.d).
+-- CDC tables are in cdc.sql. Timestamps are pinned to UTC so ingest stays
+-- deterministic regardless of container or server timezone.
 
 CREATE DATABASE IF NOT EXISTS udp;
 

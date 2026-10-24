@@ -1,8 +1,9 @@
-# S3 infra + S4 connect pipelines + S5 model server (profile `model`) +
-# S6 notify pipeline + S7 conduit bus CDC (postgres → pg_changes → app_users_cdc).
+# Infrastructure, Connect pipelines, optional model server (profile `model`),
+# and the Conduit bus CDC path (postgres -> pg_changes -> app_users_cdc).
 # Default stack: `make up` (no model). Real-model stack: `make up-model`.
 #
-# Pinned images (linux/amd64, verified 2026-10-13):
+# Tested images (linux/amd64, verified 2026-10-13). The tags below are used;
+# the digests are recorded for pinning a deployment:
 #   redpandadata/redpanda:v26.2.4             sha256:c98c2f04a751e6646012cc701bac5183252cee44c88ba1dfa412e4c7124f2e89
 #   clickhouse/clickhouse-server:26.9.13.15   sha256:04fc72b8a58e58200c706f375ef81ec7112de3515e898de63f6c72843d7a2eeb
 #   postgres:16-alpine                        sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
@@ -18,7 +19,7 @@
 # the HTTP API port 8080 (8084 is the gRPC API).
 #
 # Kafka listener layout (single-node dev):
-#   PLAINTEXT 29092 — intra-compose clients (console, S4 connect, S7 conduit)
+#   PLAINTEXT 29092 — intra-compose clients (console, connect, conduit)
 #   EXTERNAL  9092  — host clients, advertised as localhost:9092 so it matches
 #                     REDPANDA_BOOTSTRAP. A single PLAINTEXT listener advertised
 #                     as redpanda:9092 breaks host producers: after bootstrap the
@@ -73,17 +74,21 @@ services:
       - |
         ensure() {
           local t=$$1
+          # One partition on every dev topic. `pg_changes` needs it: the cdc
+          # pipeline dedupes on the Kafka offset, which is a total order only
+          # inside one partition.
           if rpk -X brokers=redpanda:29092 topic describe "$$t" >/dev/null 2>&1; then
             echo "topic exists: $$t"
           else
-            rpk -X brokers=redpanda:29092 topic create "$$t" -c cleanup.policy=delete -c retention.ms=604800000
+            rpk -X brokers=redpanda:29092 topic create "$$t" -p 1 -c cleanup.policy=delete -c retention.ms=604800000
           fi
         }
         ensure tickets
         ensure fast_decisions
         ensure model_decisions
         ensure tickets_dlq
-        ensure pg_changes # S7 — conduit bus CDC changelog
+        ensure pg_changes
+        ensure pg_changes_dlq
         rpk -X brokers=redpanda:29092 topic list
     networks:
       - udp-net
@@ -107,7 +112,7 @@ services:
     volumes:
       - clickhouse-data:/var/lib/clickhouse
       - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-      - ./clickhouse/cdc.sql:/docker-entrypoint-initdb.d/cdc.sql:ro # S7 cdc mirror
+      - ./clickhouse/cdc.sql:/docker-entrypoint-initdb.d/cdc.sql:ro # CDC mirror
     mem_limit: 3g
     networks:
       - udp-net
@@ -120,7 +125,7 @@ services:
 
   postgres:
     image: postgres:16-alpine
-    # S7 — Conduit's postgres source runs in logrepl CDC mode, which needs
+    # Conduit's postgres source runs in logrepl CDC mode, which needs
     # logical decoding: SHOW wal_level must return `logical` (default is
     # `replica`). Verified 2026-10-13.
     command: ["postgres", "-c", "wal_level=logical"]
@@ -167,7 +172,7 @@ services:
       retries: 6
       start_period: 15s
 
-  # S5 — real Laya decision server, joined to the compose network as a
+  # Real Laya decision server, joined to the compose network as a
   # container because ufw drops container→host INPUT on this box (a host-run
   # `make model` is otherwise equivalent; see the decide service comment).
   # The GPU is shared (jellyfin): the RX 6600 XT schedules /dev/kfd between
@@ -186,9 +191,12 @@ services:
       MODEL_PORT: "8081"
       HF_HOME: /app/.hf-cache
       USE_TF: "0"
+      PYTHONDONTWRITEBYTECODE: "1"
       PYTHONPATH: /app/.venv/lib/python3.12/site-packages:/app/src
     volumes:
-      - .:/app
+      - ./src:/app/src:ro
+      - ./.venv:/app/.venv:ro
+      - ./.hf-cache:/app/.hf-cache
     devices:
       - /dev/kfd:/dev/kfd
       - /dev/dri/renderD128:/dev/dri/renderD128
@@ -208,7 +216,7 @@ services:
       retries: 12
       start_period: 90s
 
-  # S4 — ingest pipeline: tickets → udp.tickets_raw (DLQ: tickets_dlq).
+  # Ingest pipeline: tickets → udp.tickets_raw (DLQ: tickets_dlq).
   ingest:
     image: redpandadata/connect:4.113.0
     command: ["run", "/etc/connect/ingest.yaml"]
@@ -236,8 +244,8 @@ services:
       retries: 6
       start_period: 15s
 
-  # S4 — decide pipeline: tickets → fast_decisions / model_decisions.
-  # MODEL_ENDPOINT_URL defaults at the in-network model server (S5; see the
+  # Decide pipeline: tickets → fast_decisions / model_decisions.
+  # MODEL_ENDPOINT_URL defaults at the in-network model server (see the
   # `model` service below). A HOST-run model server (make model) stays
   # selectable via MODEL_ENDPOINT_URL in .env — note that ufw drops
   # container→host traffic on this box, so a host-run server additionally
@@ -272,7 +280,7 @@ services:
       retries: 6
       start_period: 15s
 
-  # S6 — notify pipeline: fast_decisions + model_decisions → udp.alerts
+  # Notify pipeline: fast_decisions + model_decisions → udp.alerts
   # (+ delivery per NOTIFY_PROVIDER; log = safe default with no receiver,
   # compose.mock.yaml switches it to the mock alert receiver).
   notify:
@@ -310,7 +318,7 @@ services:
       retries: 6
       start_period: 15s
 
-  # S7 — conduit bus CDC: Postgres snapshot + WAL (logical replication) →
+  # Conduit bus CDC: Postgres snapshot + WAL (logical replication) →
   # topic `pg_changes` (OpenCDC json records: payload.before/after, op).
   # Checkpoints (source position incl. replication slot) persist in the
   # `conduit-data` badger volume, so restarts resume without re-snapshotting.
@@ -347,7 +355,7 @@ services:
       retries: 12
       start_period: 10s
 
-  # S7 — cdc pipeline: topic `pg_changes` (conduit's OpenCDC records) →
+  # CDC pipeline: topic `pg_changes` (conduit's OpenCDC records) →
   # udp.app_users_cdc. Reads every change op; current-state dedupe is
   # read-time (argMax per id keyed on the kafka offset, latest op wins,
   # op='d' ids excluded — see clickhouse/cdc.sql).

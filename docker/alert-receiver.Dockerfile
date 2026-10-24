@@ -1,5 +1,5 @@
-# Mock alert receiver (S6 verification stand-in for Telegram/Discord).
-# Dependencies are baked at build time — no network access at runtime.
+# Mock alert receiver: a stand-in for Telegram and Discord.
+# Dependencies are baked at build time; the container needs no network.
 FROM python:3.12-slim
 
 RUN pip install --no-cache-dir fastapi==0.143.0 uvicorn==0.54.0

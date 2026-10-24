@@ -1,8 +1,8 @@
-# S4 override: adds the mock Jev decision server (stand-in for the S5 Laya
-# server) and retargets the decide pipeline at it (the base stack points at
-# the real model container, http://model:8081).
-# S6 override: adds the mock alert receiver and switches the notify pipeline
-# to it (NOTIFY_PROVIDER=mock; the base default is log).
+# Mock-mode override: adds the mock decision server (stand-in for the Laya
+# server) and retargets the decide pipeline at it. The base stack points at the
+# real model container, http://model:8081.
+# It also adds the mock alert receiver and switches the notify pipeline to it
+# (NOTIFY_PROVIDER=mock; the base default is log).
 #
 #   docker compose -f docker-compose.yaml -f compose.mock.yaml up -d --wait
 #   (make up-mock)
@@ -23,8 +23,8 @@ services:
       retries: 12
       start_period: 5s
 
-  # S6 — in-memory alert receiver: POSTs from the notify pipeline are recorded
-  # with receipt times for verification joins. In-network only (no host port);
+  # In-memory alert receiver: POSTs from the notify pipeline are recorded with
+  # receipt times for verification joins. In-network only (no host port);
   # reachable as alert-receiver:8082 from the compose network.
   alert-receiver:
     build:

@@ -34,7 +34,7 @@ def model_decision_kwargs() -> dict[str, Any]:
     """Return a valid ModelDecision payload (answers = the real wire shape)."""
     return {
         "event_id": TICKET_KWARGS["event_id"],
-        "decision_id": "4f9c2a8e7b3d4a1f8c6e2d5b0a9f7e34",
+        "decision_id": "model:9f0c8b7e6d5a4940b2f1c3d4e5f60718",
         "question_type": "choice",
         "answers": {
             "escalate_now": {"type": "noul", "noul": 0.91, "confidence": 0.91},
@@ -62,7 +62,7 @@ def alert_event_kwargs() -> dict[str, Any]:
     """Return a valid AlertEvent payload."""
     return {
         "event_id": TICKET_KWARGS["event_id"],
-        "decision_id": "4f9c2a8e7b3d4a1f8c6e2d5b0a9f7e34",
+        "decision_id": "model:9f0c8b7e6d5a4940b2f1c3d4e5f60718",
         "channel": "mock",
         "created_at": NOW,
     }
@@ -178,3 +178,15 @@ def test_alert_channel_records_fanout_list() -> None:
     """The pipeline writes comma-list channels (telegram,discord) — AlertEvent accepts them."""
     alert = AlertEvent.model_validate({**alert_event_kwargs(), "channel": "telegram,discord"})
     assert alert.channel == "telegram,discord"
+
+
+def test_alert_channel_accepts_log() -> None:
+    """Log-only mode records channel log, not mock."""
+    alert = AlertEvent.model_validate({**alert_event_kwargs(), "channel": "log"})
+    assert alert.channel == "log"
+
+
+def test_alert_channel_rejects_unknown_value() -> None:
+    """The channel contract is a closed set."""
+    with pytest.raises(ValidationError):
+        AlertEvent.model_validate({**alert_event_kwargs(), "channel": "carrier-pigeon"})

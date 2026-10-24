@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import random
 import sys
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from confluent_kafka import KafkaError, Message, Producer
@@ -30,7 +31,7 @@ DEFAULT_SEED = 42
 NOMINAL_RATE_EPS = 100.0
 DEFAULT_AMBIGUOUS_FRACTION = 0.05  # ≤5 flagged/s at the nominal rate
 
-# Burst budget (S0 measured ~12-15 dec/s on this GPU): demo bursts cap flagged
+# Burst budget (measured ~12-15 dec/s on this GPU): demo bursts cap flagged
 # events at 0.5 × 12 dec/s × 60 s = 360 so the model path never oversubscribes.
 MODEL_CEILING_DEC_PER_S = 12.0
 FLAG_BUDGET_HEADROOM = 0.5
@@ -40,6 +41,13 @@ MAX_FLAGGED_PER_BURST = int(MODEL_CEILING_DEC_PER_S * FLAG_BUDGET_HEADROOM * BUR
 
 USER_POOL_SIZE = 500
 MAX_BACKLOG_S = 60.0
+DEFAULT_BOOTSTRAP = "127.0.0.1:9092"
+
+
+def default_bootstrap() -> str:
+    """Resolve the Kafka bootstrap servers from the environment."""
+    return os.environ.get("REDPANDA_BOOTSTRAP", DEFAULT_BOOTSTRAP)
+
 
 #: Per-category event weights for the steady profile (must cover every category).
 _STEADY_WEIGHTS: Mapping[Category, float] = {
@@ -105,7 +113,7 @@ TEMPLATES: dict[Category, tuple[str, ...]] = {
 #: Garbled / mixed-label texts the fast path cannot classify confidently —
 #: exactly what the cascade flags for the model (``category_hint`` is None).
 #: Every entry must dodge the rule-table keywords, else the fast path eats it
-#: and the ~5% flagged stream collapses (measured S8: 95/5 fast/model split).
+#: and the ~5% flagged stream collapses (measured: 95/5 fast/model split).
 AMBIGUOUS_TEMPLATES: tuple[str, ...] = (
     "so my payment went thru but the app says unpaid and support chat is dead?? is this even legit",
     "asdkjh paymnt... app... brokn??? pls",
@@ -129,19 +137,24 @@ class BurstProfile:
     flagged_budget: int | None = None
 
     def __post_init__(self) -> None:
-        """Assert the profile stays inside the model's decision capacity."""
+        """Reject a profile that exceeds the model's decision capacity."""
+        if not 0.0 <= self.scam_share < 1.0:
+            raise ValueError("scam_share must be in [0, 1)")
         if self.duration_s is None:
-            assert self.flagged_budget is None, "flagged_budget requires a burst window"
-            assert 0.0 <= self.scam_share < 1.0
+            if self.flagged_budget is not None:
+                raise ValueError("flagged_budget requires a burst window")
             return
-        assert self.duration_s > 0, "burst duration must be positive"
-        assert self.rate_multiplier >= 1.0, "bursts never slow the stream down"
-        assert self.flagged_budget is not None, "a burst must declare a flagged budget"
-        assert 0.0 <= self.scam_share < 1.0, "scam_share must be in [0, 1)"
+        if self.duration_s <= 0:
+            raise ValueError("burst duration must be positive")
+        if self.rate_multiplier < 1.0:
+            raise ValueError("bursts never slow the stream down")
+        if self.flagged_budget is None:
+            raise ValueError("a burst must declare a flagged budget")
         capacity = int(self.duration_s * MODEL_CEILING_DEC_PER_S * FLAG_BUDGET_HEADROOM)
-        assert self.flagged_budget <= capacity, (
-            f"flagged_budget {self.flagged_budget} exceeds burst capacity {capacity}"
-        )
+        if self.flagged_budget > capacity:
+            raise ValueError(
+                f"flagged_budget {self.flagged_budget} exceeds burst capacity {capacity}"
+            )
 
 
 STEADY = BurstProfile(name="steady")
@@ -170,14 +183,17 @@ class GeneratorConfig:
     profile: BurstProfile = STEADY
     count: int | None = None
     ambiguous_fraction: float = DEFAULT_AMBIGUOUS_FRACTION
-    bootstrap: str = "localhost:9092"
+    bootstrap: str = field(default_factory=default_bootstrap)
     topic: str = "tickets"
 
     def __post_init__(self) -> None:
-        """Assert the configuration is generatable at all."""
-        assert self.rate > 0, "rate must be positive"
-        assert self.count is None or self.count >= 0, "count must be non-negative"
-        assert 0.0 <= self.ambiguous_fraction <= 1.0, "ambiguous_fraction must be in [0, 1]"
+        """Reject a configuration that cannot generate a stream."""
+        if self.rate <= 0:
+            raise ValueError("rate must be positive")
+        if self.count is not None and self.count < 0:
+            raise ValueError("count must be non-negative")
+        if not 0.0 <= self.ambiguous_fraction <= 1.0:
+            raise ValueError("ambiguous_fraction must be in [0, 1]")
 
 
 class _PlaceholderDict(dict[str, str]):
@@ -305,11 +321,17 @@ class TicketPublisher:
     def __init__(self, bootstrap: str, topic: str = "tickets") -> None:
         self._topic = topic
         self._producer = Producer({"bootstrap.servers": bootstrap})
+        self._delivery_errors = 0
 
-    @staticmethod
-    def _on_delivery(err: KafkaError | None, msg: Message | None) -> None:
-        """Report failed deliveries on stderr."""
+    @property
+    def delivery_errors(self) -> int:
+        """Number of deliveries that librdkafka reported as failed."""
+        return self._delivery_errors
+
+    def _on_delivery(self, err: KafkaError | None, msg: Message | None) -> None:
+        """Count and report failed deliveries on stderr."""
         if err is not None:
+            self._delivery_errors += 1
             print(f"udp-generate: delivery failed: {err}", file=sys.stderr)
 
     def publish(self, ticket: Ticket) -> str:
@@ -344,6 +366,7 @@ def run(config: GeneratorConfig, *, dry_run: bool = False) -> int:
     burst_interval = 1.0 / (config.rate * config.profile.rate_multiplier)
     burst_events = generator.burst_event_count()
     emitted = 0
+    exit_code = 0
     deadline = time.monotonic()
     events = generator.stream() if config.count is None else generator.events(config.count)
     try:
@@ -362,7 +385,14 @@ def run(config: GeneratorConfig, *, dry_run: bool = False) -> int:
         pass
     finally:
         if publisher is not None:
-            publisher.flush()
+            undelivered = publisher.flush()
+            if undelivered or publisher.delivery_errors:
+                print(
+                    f"udp-generate: {undelivered} undelivered, "
+                    f"{publisher.delivery_errors} delivery errors",
+                    file=sys.stderr,
+                )
+                exit_code = 1
     mode = "printed" if publisher is None else "published"
     count = "∞" if config.count is None else str(config.count)
     print(
@@ -370,7 +400,23 @@ def run(config: GeneratorConfig, *, dry_run: bool = False) -> int:
         f"seed={config.seed}, rate={config.rate:g}/s, topic={config.topic})",
         file=sys.stderr,
     )
-    return 0
+    return exit_code
+
+
+def _positive_float(value: str) -> float:
+    """Parse a positive float for argparse."""
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def _non_negative_int(value: str) -> int:
+    """Parse a non-negative integer for argparse."""
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return parsed
 
 
 def build_generate_parser(add_help: bool = True) -> argparse.ArgumentParser:
@@ -392,7 +438,15 @@ def build_generate_parser(add_help: bool = True) -> argparse.ArgumentParser:
         "--seed", type=int, default=DEFAULT_SEED, help="same seed ⇒ same ticket sequence"
     )
     parser.add_argument(
-        "--rate", type=float, default=NOMINAL_RATE_EPS, help="nominal events/s; bursts multiply"
+        "--rate",
+        type=_positive_float,
+        default=NOMINAL_RATE_EPS,
+        help="nominal events/s; bursts multiply",
+    )
+    parser.add_argument(
+        "--bootstrap",
+        default=None,
+        help="Kafka bootstrap servers (default: REDPANDA_BOOTSTRAP or 127.0.0.1:9092)",
     )
     parser.add_argument(
         "--profile",
@@ -402,7 +456,7 @@ def build_generate_parser(add_help: bool = True) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--count",
-        type=int,
+        type=_non_negative_int,
         default=None,
         metavar="N",
         help="total events; omit = stream until Ctrl+C",
@@ -422,6 +476,7 @@ def run_from_namespace(args: argparse.Namespace) -> int:
         rate=args.rate,
         profile=PROFILES[args.profile],
         count=args.count,
+        bootstrap=args.bootstrap or default_bootstrap(),
     )
     return run(config, dry_run=args.dry_run)
 

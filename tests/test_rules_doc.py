@@ -1,10 +1,9 @@
 """docs/rules.md must mirror decide.yaml's executable rule table.
 
-The table lives twice: the bloblang mapping decide actually runs, and the
-human-readable mirror in docs/rules.md. They have drifted twice on this
-branch (review rounds 1 and 2), so the keyword lists, the first-match order,
-and the confidences are pinned here. The decide.yaml header comment is a
-third copy and is deliberately not parsed.
+The mapping in connect/decide.yaml is the source of truth. The keyword lists,
+the first-match order, and the confidences in the human-readable mirror are
+pinned here. Rows 7-8 are ambiguous heuristics, not category rules, so this
+test does not parse them.
 """
 
 from __future__ import annotations

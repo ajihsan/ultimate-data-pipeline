@@ -1,18 +1,18 @@
-# S7 — cdc pipeline: topic `pg_changes` (conduit's OpenCDC records) →
-# ClickHouse `udp.app_users_cdc`.
+# cdc pipeline: topic `pg_changes` (conduit OpenCDC records) → udp.app_users_cdc.
 #
-# Committed offsets resume restarts; an offset reset replays and re-lands
-# rows (at-least-once) — CURRENT STATE is a read-time contract: argMax per id
-# keyed on the kafka offset (the changelog's stable total order, preserved
-# across replays — unlike landed_at, which a replay re-stamps), ids whose
-# latest op is 'd' dropped (see clickhouse/cdc.sql for the full rationale).
+# Committed offsets resume restarts; an offset reset replays and re-lands rows
+# (at-least-once). CURRENT STATE is a read-time contract: argMax per id keyed
+# on the Kafka offset (stable across replays, unlike landed_at). Ids whose
+# latest op is 'd' are dropped. See clickhouse/cdc.sql.
 #
 # Input records are conduit's default opencdc/json:
 #   {"position": <b64 json>, "operation": "snapshot|create|update|delete",
 #    "metadata": {...}, "key": {"id": N}, "payload": {"before", "after"}}
-# DELETE events carry only the key (default replica identity) → tombstone
-# rows (op='d') land with empty strings and NULL timestamps.
+# DELETE events carry only the key, so tombstones land with empty strings and
+# NULL timestamps. A record that cannot be mapped goes to `pg_changes_dlq`
+# with the reason as the key; one bad record must not pin the offset.
 #
+# `pg_changes` MUST have one partition: the offset is the changelog order.
 # Metrics: Prometheus on :4195/metrics. Health: GET :4195/ping.
 
 http:
@@ -29,71 +29,92 @@ input:
 
 pipeline:
   processors:
-    - mapping: |
-        # OpenCDC record → one flat row. after wins over before over key:
-        # snapshot/create/update carry the full row in payload.after; a delete
-        # carries the old tuple in payload.before (key columns only) with
-        # after=null.
-        let row = this.payload.after | this.payload.before | this.key
-        root = {
-          "id": ($row.id | this.key.id).number(),
-          "email": $row.email | "",
-          "plan": $row.plan | "",
-          "status": $row.status | "",
-          "created_at": match {
-            $row.created_at != null => $row.created_at.ts_format("2006-01-02 15:04:05.999", "UTC"),
-            _ => null,
-          },
-          "updated_at": match {
-            $row.updated_at != null => $row.updated_at.ts_format("2006-01-02 15:04:05.999", "UTC"),
-            _ => null,
-          },
-          "op": match {
-            this.operation == "create" => "c",
-            this.operation == "update" => "u",
-            this.operation == "delete" => "d",
-            _ => "snapshot",
-          },
-          # Decoded OpenCDC position JSON (type + last_lsn) — the replication
-          # trace of the row.
-          "position": this.position.decode("base64"),
-          # Kafka offset — the read-time dedupe key's authority (stable across
-          # replays, unlike landed_at). number() → int64 for the UInt64 column.
-          "offset": meta("kafka_offset").number(),
-        }
+    - try:
+        - mapping: |
+            # OpenCDC record → one flat row. after wins over before over key:
+            # snapshot/create/update carry the full row in payload.after; a delete
+            # carries the old tuple in payload.before (key columns only) with
+            # after=null.
+            let row = this.payload.after | this.payload.before | this.key
+            root = {
+              "id": ($row.id | this.key.id).number(),
+              "email": $row.email | "",
+              "plan": $row.plan | "",
+              "status": $row.status | "",
+              "created_at": match {
+                $row.created_at != null => $row.created_at.ts_format("2006-01-02 15:04:05.999", "UTC"),
+                _ => null,
+              },
+              "updated_at": match {
+                $row.updated_at != null => $row.updated_at.ts_format("2006-01-02 15:04:05.999", "UTC"),
+                _ => null,
+              },
+              "op": match {
+                this.operation == "create" => "c",
+                this.operation == "update" => "u",
+                this.operation == "delete" => "d",
+                _ => "snapshot",
+              },
+              # Decoded OpenCDC position JSON (type + last_lsn) — the replication
+              # trace of the row.
+              "position": this.position.decode("base64"),
+              # Kafka offset — the read-time dedupe key's authority (stable across
+              # replays, unlike landed_at). number() → int64 for the UInt64 column.
+              "offset": meta("kafka_offset").number(),
+            }
+    - catch:
+        - metric:
+            type: counter
+            name: cdc_malformed_total
+        - log:
+            level: WARN
+            message: "cdc: malformed pg_changes record → pg_changes_dlq (${! error() })"
+        - mapping: 'meta dlq_reason = "malformed_pg_changes: " + error()'
 
 output:
-  # DateTime64(3) columns take the normalized "2006-01-02 15:04:05.999" form;
-  # null timestamps only occur on op='d' tombstones (Nullable in cdc.sql).
-  sql_insert:
-    driver: clickhouse
-    dsn: ${CLICKHOUSE_DSN}
-    table: app_users_cdc
-    columns:
-      - id
-      - email
-      - plan
-      - status
-      - created_at
-      - updated_at
-      - op
-      - position
-      - offset
-    args_mapping: |
-      root = [
-        this.id,
-        this.email,
-        this.plan,
-        this.status,
-        this.created_at,
-        this.updated_at,
-        this.op,
-        this.position,
-        this.offset,
-      ]
-    batching:
-      count: 100
-      period: 1s
+  switch:
+    retry_until_success: true # sink outages retry instead of losing rows
+    cases:
+      # A record that cannot be mapped must not pin the consumer offset.
+      - check: '(meta("dlq_reason") | "") != ""'
+        output:
+          kafka:
+            addresses:
+              - redpanda:29092
+            topic: pg_changes_dlq
+            key: ${! meta("dlq_reason") }
+      # DateTime64(3) columns take the normalized "2006-01-02 15:04:05.999" form;
+      # null timestamps only occur on op='d' tombstones (Nullable in cdc.sql).
+      - output:
+          sql_insert:
+            driver: clickhouse
+            dsn: ${CLICKHOUSE_DSN}
+            table: app_users_cdc
+            columns:
+              - id
+              - email
+              - plan
+              - status
+              - created_at
+              - updated_at
+              - op
+              - position
+              - offset
+            args_mapping: |
+              root = [
+                this.id,
+                this.email,
+                this.plan,
+                this.status,
+                this.created_at,
+                this.updated_at,
+                this.op,
+                this.position,
+                this.offset,
+              ]
+            batching:
+              count: 100
+              period: 1s
 
 metrics:
   prometheus: {}

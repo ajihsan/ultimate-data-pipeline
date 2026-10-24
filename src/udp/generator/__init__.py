@@ -6,6 +6,7 @@ the standalone ``udp-generate`` script share one implementation.
 
 from udp.generator.tickets import (
     DEFAULT_AMBIGUOUS_FRACTION,
+    DEFAULT_BOOTSTRAP,
     DEFAULT_SEED,
     NOMINAL_RATE_EPS,
     PROFILES,
@@ -13,6 +14,7 @@ from udp.generator.tickets import (
     GeneratorConfig,
     TicketGenerator,
     TicketPublisher,
+    default_bootstrap,
     main,
     run,
     run_from_namespace,
@@ -20,6 +22,7 @@ from udp.generator.tickets import (
 
 __all__ = [
     "DEFAULT_AMBIGUOUS_FRACTION",
+    "DEFAULT_BOOTSTRAP",
     "DEFAULT_SEED",
     "NOMINAL_RATE_EPS",
     "BurstProfile",
@@ -27,6 +30,7 @@ __all__ = [
     "PROFILES",
     "TicketGenerator",
     "TicketPublisher",
+    "default_bootstrap",
     "main",
     "run",
     "run_from_namespace",
