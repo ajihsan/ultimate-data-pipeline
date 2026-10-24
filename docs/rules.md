@@ -1,9 +1,9 @@
-# Cascade fast-path rules (S4)
+# Cascade fast-path rules
 
 The decide pipeline (`connect/decide.yaml`) classifies every ticket with a
-deterministic **first-match** rule table before any model call. Rules are
-evaluated in priority order on the lowercased ticket text (substring match);
-the first hit wins and no later rule is consulted.
+deterministic **first-match** rule table before any model call. Rules run in
+priority order on the lowercased ticket text. Each rule uses a substring match.
+The first hit wins, and no later rule runs.
 
 | Priority | Verdict | Confidence | Keywords (lowercase substrings) |
 |---|---|---|---|
@@ -18,22 +18,26 @@ the first hit wins and no later rule is consulted.
 
 Semantics:
 
-- **Rules 1–6 (confident):** a `FastDecision` is emitted to
-  `udp.fast_decisions` + topic `fast_decisions`. The model is never called.
-- **Rules 7–8 (flagged):** the ticket is POSTed to `/v1/systemone`
-  (`MODEL_ENDPOINT_URL`, 1500 ms timeout, 1 retry, backoff on 429/503). Every
-  flagged event yields a `ModelDecision` row — the model's answers on success,
-  or a degraded fallback (`escalate_probability`/`scam_probability` = 0,
-  `degraded = true`, `answers = {"error": <message>}`) when the endpoint fails
-  or answers a 200 the pipeline cannot read;
-  degraded verdicts increment the `model_degraded_total` Prometheus counter.
-  Concurrency is capped so that never happens in load: decide runs 4 pipeline
-  workers (`pipeline.threads`), so concurrent model calls cap at 4 → the
-  server's `predict_batch` cohorts stay ≤ 4 states (≤ ~310 ms ≪ 1500 ms).
-- Keyword lists are tuned against the S2 synthetic generator's template pool
-  (seeded benchmark: 6000 events, seed 7 → 4.98% flagged). Real traffic will
-  need tuning; the table exists so the fast path stays auditable and cheap.
+- **Rules 1–6 (confident):** decide emits a `FastDecision` to
+  `udp.fast_decisions` and topic `fast_decisions`. It never calls the model.
 
-The YAML comment block in `connect/decide.yaml` is the source of truth the
-pipeline executes; `docs/rules.md` is its human-readable mirror (kept in sync
-by review — there is no doc-drift test).
+- **Rules 7–8 (flagged):** decide POSTs the ticket to `/v1/systemone`
+  (`MODEL_ENDPOINT_URL`, 1500 ms timeout, 1 retry, backoff on 429/503). Every
+  flagged event yields a `ModelDecision` row, with the model answers on success
+  or a degraded fallback. The fallback sets `escalate_probability` and
+  `scam_probability` to 0, `degraded = true`, and
+  `answers = {"error": <message>}`. It applies when the endpoint fails or
+  returns a 200 that the pipeline cannot read. Decide runs 4 pipeline workers
+  (`pipeline.threads`), so concurrent model calls cap at 4. The server's
+  `predict_batch` cohorts stay at 4 states or fewer (≤ ~310 ms, below the
+  1500 ms timeout).
+
+- Keyword lists are tuned against the synthetic generator's template pool. The
+  seeded benchmark used 6000 events and seed 7, and flagged 4.98%. Real traffic
+  needs new tuning. The table keeps the fast path auditable and cheap.
+
+Degraded verdicts increment the `model_degraded_total` counter.
+
+The mapping in `connect/decide.yaml` is the source of truth. This table is the
+human-readable mirror. `tests/test_rules_doc.py` checks that the category,
+confidence, and keyword lists match.

@@ -1,8 +1,13 @@
 # Ultimate Data Pipeline — Realtime
 
-Synthetic app-user ticket stream → cascade decision (deterministic rule fast path, Laya decision model for what the rules can't classify) → ClickHouse → Telegram/Discord triggers, with Postgres CDC flowing through a Conduit bus. Everything is config-first Redpanda Connect pipelines on a single-node Redpanda cluster, a consumer-ROCm model runtime (RX 6600 XT via TheRock wheels — no cloud inference, no system ROCm install), and a compose stack that comes up in one command. The realtime path replaces the legacy JVM stack (Debezium/Kafka/Flink/Mastodon producer).
+This repository contains a real-time pipeline for app-user tickets. The
+pipeline classifies each ticket with a deterministic rule table. It sends
+tickets that the rules cannot classify to a Laya decision model. It stores
+decisions in ClickHouse and sends alerts to Telegram or Discord. Postgres
+changes flow through a Conduit bus.
 
-**Status:** v1 feature-complete on branch `feat/realtime-v1-redpanda` (S0–S8 landed; acceptance table below is measured, not aspirational).
+The realtime stack replaces the legacy JVM stack (Debezium, Kafka, Flink, and
+the Mastodon producer). The legacy stack remains in git history.
 
 ## Architecture
 
@@ -26,106 +31,163 @@ Synthetic app-user ticket stream → cascade decision (deterministic rule fast p
                        └───────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **ingest** — topic `tickets` → `udp.tickets_raw`; malformed/missing-field tickets → topic `tickets_dlq` (never dropped silently).
-- **decide** — the cascade: 6 keyword rules classify ~95% in-process (~2ms); flagged/ambiguous tickets (~5%) POST the `/v1/systemone` contract to the Laya model container; every flagged ticket yields a row in `udp.model_decisions` (real verdict or degraded fallback on any endpoint failure).
-- **notify** — qualifies decisions against `THRESHOLD_SCAM_P=0.35` / `THRESHOLD_ESCALATE_P=0.75`, dedupes by `decision_id` (point query against `udp.alerts` — restart-safe), rate-limits to 10 delivered alerts/epoch-minute (drop-and-record: extras land as `suppressed=true`), delivers to Telegram/Discord (or the in-network mock receiver).
-- **conduit + cdc** — Postgres `app_users` snapshot + WAL (logical replication) → topic `pg_changes` (OpenCDC) → `udp.app_users_cdc` change log.
+- **ingest** reads topic `tickets` and writes `udp.tickets_raw`. A malformed
+  ticket goes to topic `tickets_dlq`. A ticket with a missing or invalid
+  required field also goes to that topic. The pipeline does not drop it
+  silently.
 
-Full component inventory, pinned images, failure semantics: [docs/architecture.md](docs/architecture.md). Wire schemas: [docs/schemas.md](docs/schemas.md).
+- **decide** runs the cascade. Six keyword rules classify about 95% of tickets
+  in process. The remaining tickets POST the `/v1/systemone` contract to the
+  Laya model container. Every flagged ticket produces a row in
+  `udp.model_decisions`: a real verdict or a degraded fallback.
+
+- **notify** checks a decision against `THRESHOLD_SCAM_P=0.35` and
+  `THRESHOLD_ESCALATE_P=0.75`. It drops a duplicate `decision_id` with a point
+  query against `udp.alerts`. It limits delivery to 10 alerts per epoch minute.
+  Extra alerts land with `suppressed=true`. Delivery goes to Telegram, Discord,
+  the log, or the in-network mock receiver.
+
+- **conduit + cdc** copy Postgres `app_users` changes through logical
+  replication to topic `pg_changes`. The `cdc` pipeline writes the change log
+  to `udp.app_users_cdc`. A malformed record goes to `pg_changes_dlq`.
+
+Full component inventory, ports, and failure semantics:
+[docs/architecture.md](docs/architecture.md). Wire contracts:
+[docs/schemas.md](docs/schemas.md).
 
 ## Quickstart
 
-Prereqs: **docker** (compose v2) and **uv**. That's it — no system ROCm, no Kafka, no cloud account.
+Prerequisites: Docker with Compose v2 and `uv`. The project needs no system
+ROCm, no Kafka install, and no cloud account.
 
 ```bash
-make sync        # uv sync --inexact (installs deps; --inexact preserves the .venv model runtime)
-make up-model    # full stack + the Laya model container (compose profile `model`)
-make demo        # end-to-end acceptance on the real model (see below)
+make sync        # uv sync --inexact (preserves the .venv model runtime)
+make up-model    # full stack plus the Laya model container (profile `model`)
+make demo        # end-to-end acceptance on the real model
 ```
 
-`make demo` = `tests/integration/smoke.sh --model`: clean slate → healthchecks → steady 2000 @ 100 ev/s → scam-spike burst → SQL asserts (counts, 95/5 split, degraded=0, DLQ=0, alert joins) → notifier joins → CDC round-trip. It prints a PASS/FAIL table and exits non-zero on any failure. `bash tests/integration/smoke.sh` (no flag) runs the same thing on the mock decision server — no GPU needed — and is what CI runs.
+`make demo` runs `tests/integration/smoke.sh --model`. It starts from a clean
+slate and sends 2000 tickets at 100 events/s. It runs a scam burst and checks
+counts, the 95/5 split, degraded rows, the DLQ, alert joins, and CDC. It prints
+a PASS/FAIL table and exits nonzero on a failure.
 
-### Demo walkthrough (what actually happens)
+`bash tests/integration/smoke.sh` runs the same checks on the mock decision
+server. It needs no GPU. The CI smoke job runs this mode.
 
-1. `make up-model` brings up redpanda, clickhouse, postgres, console, the four pipelines, conduit, and the model container (GPU handoff via `/dev/kfd` + render GIDs; weights come from the bind-mounted `.hf-cache`).
-2. The **steady phase** publishes 2000 tickets at 100 ev/s: ~95% classified by the rule fast path, ~5% flagged to Laya. `udp.alerts` starts filling: every qualifying decision (mock receiver / phone with a real token) — rate-limited to 10/min.
-3. The **scam-spike burst** (`--profile demo`: 60s at 3× rate, capped at 360 flagged) floods scam_report tickets — the fast path absorbs 98%+ in-process, the model handles the tail, and the receiver sees a steady 10 alerts/min without a single dropped row (extras are recorded as `suppressed=true`).
-4. Watch it live: `docker compose exec -T alert-receiver python -c 'import json,urllib.request; print(json.dumps(json.load(urllib.request.urlopen("http://localhost:8082/alerts"))["alerts"][-3:], indent=2))'`, or open the console on http://127.0.0.1:8085.
+### Demo walkthrough
 
-To watch alerts on an actual phone instead of the mock receiver: set `NOTIFY_PROVIDER=telegram` (+ `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`) in `.env` and re-`make up-model` — the alerts table and rate limit behave identically.
+1. `make up-model` starts Redpanda, ClickHouse, Postgres, Console, the four
+   pipelines, Conduit, and the model container. The model uses the bind-mounted
+   `.venv` and `.hf-cache` and the GPU device nodes.
 
-### Device matrix (works on my PC first, then others)
+2. The steady phase sends 2000 tickets at 100 events/s. About 95% take the rule
+   fast path and about 5% go to Laya. `udp.alerts` fills, limited to 10
+   delivered alerts per minute.
 
-| device | runtime | status |
-|---|---|---|
-| **AMD RX 6600 XT (gfx1032) — this PC** | TheRock nightly ROCm wheels (`torch 2.14.0+rocm10.1.0`) in the project `.venv`; runs via the compose `model` profile (bind-mounted `.venv` + `.hf-cache`, `/dev/kfd` + render GIDs) — **no system ROCm** | **primary, measured** (S0/S5: 15.72 dec/s local, p95 64ms in-process / 196ms HTTP) |
-| NVIDIA | install torch CUDA wheels into `.venv` (e.g. `uv pip install torch --index-url https://download.pytorch.org/whl/cu126`) and run the model container with `gpus: all` instead of `/dev/kfd` — the server code is device-agnostic (`cuda` works on both) | documented alternative |
-| Apple Silicon | MPS: point `laya.load` at `mps` (`DEFAULT_DEVICE` in `src/udp/model_server.py`); bf16 autocast behavior differs on MPS — evaluate before trusting latencies | documented alternative, untested |
-| ROCm/PyTorch baked into docker | alternative to bind-mounting the host venv: bake the TheRock wheels into the model image — base is pinned `python:3.12-bookworm@sha256:5560e9ab…` in docker-compose.yaml | documented alternative |
+3. The scam burst sends 60 s at 3× rate with a 360-event flagged budget. The
+   fast path absorbs most of the burst. Extra alerts are recorded with
+   `suppressed=true`.
 
-## Measured acceptance (S8, 2026-10-13)
+4. To watch the alerts, use the mock receiver command below or open the Console
+   at <http://127.0.0.1:8085>.
 
-The real-model chaos/load run: 60 000 tickets @ 100 ev/s × 10 min (seed 7), `docker compose kill decide notify` at t=180s + explicit restart, mock alert-receiver recording deliveries. Reproduce with `make load-test`. Prior-stage numbers from docs/jev_eval.md (S0/S5), S4/S6/S7 sessions.
+```bash
+docker compose exec -T alert-receiver python -c \
+  'import json, urllib.request; print(json.dumps(json.load(urllib.request.urlopen("http://localhost:8082/alerts"))["alerts"][-3:], indent=2))'
+```
 
-| # | criterion | result | measured |
-|---|---|---|---|
-| 1 | S0 model runtime — local throughput / latency | **PASS** | 15.72 dec/s; p95 64.1ms in-process / ~196ms HTTP |
-| 2 | S5 eval accuracy | **PASS** | 67.5% choice accuracy; scam separation 0.67 vs 0.03; complaint 16.1% (known weak head) |
-| 3 | thresholds | **PASS** | scam ≥0.35 (precision 1.00 / recall 0.87), escalate ≥0.75 |
-| 4 | S4 steady 6000 @ 100 ev/s → 95/5 fast/model split | **PASS** | 5701/299 = 95.02/4.98%; convergence 7.2s |
-| 5 | S5b pipeline latency | **PASS** | fast-path p95 81ms; model-path p95 467ms; burst degraded 0/348 |
-| 6 | S6 alerts volume + rate limit | **PASS** | 4249 unique alerts; exactly 10 delivered/min; POST p95 21.5ms |
-| 7 | S7 CDC | **PASS** | snapshot 135ms; c/u/d 361–591ms; CH current-state == Postgres 24/24 |
-| 8 | chaos: produced == landed | **PASS** | 60 000 published = 60 000 raw rows = 60 000 distinct decided (union) — zero end-to-end loss |
-| 9 | chaos: per-table distinct ≥ produced slice — **renegotiated** from "per-table ≥ produced": each ticket lands in exactly one table (union coverage gated separately) | **PASS** | raw 60 000; fast 57 232 (≥0.90× ✓); model 2768 (≥0.03× ✓) — 2026-10-13 run |
-| 10 | chaos: dupes ≤ +10% per table | **PASS** | fast 449/57 232 (0.78%), model 14/2768 (0.51%), raw 0 — all from the kill-window replay (2026-10-13 run) |
-| 11 | chaos: decision coverage (non-DLQ) | **PASS** | 0 misses; DLQ 0 |
-| 12 | chaos: alerts dedupe + delivery joins | **PASS** | 6464 rows = 6464 distinct decision_ids; 110 delivered == 110 receiver receipts |
-| 13 | chaos: rate limit holds under recovery | **PASS** | exactly 10 delivered per minute, every minute, including the restart window |
-| 14 | chaos: trigger p95 ≤ 2s | **PASS** | p95 13ms nominal window (83ms whole run) — decided_at → receiver receipt |
-| 15 | chaos: final drain | **PASS** | all 4 consumer groups lag 0 immediately after inflow stops (2026-10-14 re-verification) |
-| 16 | chaos: caught-up (lag < 700) within 120s of restart AND drained (lag < 5) within 60s of inflow end — **renegotiated** from lag<100/60s: the live-inflow committed-offset sawtooth 111–606 (input prefetch buffer) makes lag<100-while-inflow physics, and the ~40s franz session-timeout rebalance + ~40s drain put caught-up at +80–81s (measured twice, so the originally-suggested 60s bar is impossible; 120s = the pre-existing extension bar) | **PASS** (renegotiated) | caught-up at +80s (rebalance +40s, max lag 5596); lag 0 drained in 0s after inflow end; steady-inflow band 0–604 (2026-10-14 re-verification) |
-| 17 | chaos: degraded after recovery ≤ 0.5% of model rows — **renegotiated** from =0: replay-window flagged bursts can exceed the 1500ms model timeout (runs 1–3 measured 0) | **PASS** (renegotiated) | 0/3024 (2026-10-14 re-verification); worst recorded 7/2782 (0.25%) replay-window only. Terminal-in-v1 by design: p=0 → below both thresholds → no false alerts, only a coverage gap |
-| 18 | RAM (informational, not gated) | — | peak RSS: model 1.6G/5G, clickhouse 429M/3G, decide 99M, notify 125M, ingest 79M, cdc 50M, conduit 28M, redpanda 70M/1.5G, postgres 20M |
+To send alerts to a phone, set `NOTIFY_PROVIDER=telegram` plus
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`, then run `make up-model`
+again.
 
-**Honest summary: 15/17 gated criteria PASS (one informational row); rows 16–17 are renegotiated criteria (marked in the rows, measured rationale included; ratified 2026-10-15) and pass — re-verified 2026-10-14 after the deslop refactor.** The two renegotiations are restart-recovery semantics of the frozen v1 configs, both root-caused; correctness (no loss, no dupes, full coverage, rate limit, delivery) held through the kill.
+## Status and measurements
 
-## Operational notes
+v1 is feature-complete. The measured acceptance table is in
+[docs/acceptance.md](docs/acceptance.md). Key results:
 
-- **Restart semantics.** `docker compose kill` SIGKILLs and — with compose v2 — does **not** auto-restart the container within any observable window; recovery is explicit (`docker compose up -d decide notify`), which is what the chaos script does. On restart: (a) the franz consumer group sits in `PreparingRebalance` ~40s — the 45s `session.timeout.ms` of franz-go (the pipelines' input library) must expire before the group coordinator evicts the SIGKILLed member and the new one gets an assignment; (b) the backlog then drains at ~200–300 msg/s (≈40s for the ~6k accumulated here); (c) afterwards the committed offset rides a ~110–610 sawtooth behind the live stream for as long as inflow continues (input prefetch buffer stays topped up after a replay) — it is not real backlog: it drains to 0 the moment inflow stops, and delivery latency is unaffected (13ms p95). `docker compose stop` (graceful) avoids the rebalance delay.
-- **Degraded mode.** Any model failure (timeout/transport/429-503-after-retry, or a 200 whose answers shape is unreadable) stamps the ModelDecision row `degraded=true` with `escalate_probability = scam_probability = 0` and counts in the decide pipeline's `model_degraded_total` metric. Degraded rows are **terminal in v1**: p=0 never qualifies → **model down ⇒ model-tier alerting down** (the fast path keeps deciding and the rule-tier scam alerts keep firing; there is no model-tier alert coverage until the endpoint recovers). Detect it: `curl -s http://127.0.0.1:4197/metrics | grep model_degraded_total` or the SQL gauge: `SELECT count() FROM udp.model_decisions WHERE degraded AND decided_at > now() - INTERVAL 5 MINUTE`.
-- **Read-time dedupe contracts** (the tables are append logs; replays are legal and bounded):
-  - `udp.tickets_raw` — ReplacingMergeTree; readers MUST dedupe: `SELECT DISTINCT event_id …` / `argMax` / `FINAL`.
-  - `udp.fast_decisions` / `udp.model_decisions` — MergeTree with NO key uniqueness; `checkpoint_limit 1024` bounds a crash replay to ~10s of traffic, so expect a thin duplicate tail after any crash (measured: ≤0.8%). Dedupe per `event_id` at read time.
-  - `udp.alerts` — dedupe key `decision_id` (fast path synthesizes `fast:<event_id>`); `count() == uniqExact(decision_id)` is an invariant.
-  - `udp.app_users_cdc` — current state = `argMax(col, offset)` per id, `HAVING argMax(op, offset) != 'd'` (a plain `op != 'd'` filter resurrects deleted ids — see clickhouse/cdc.sql).
-- **Cold-start quirk.** The first franz fetch after a pipeline (re)start takes ~2–4.4s one-time (chunk warm-up) — the first decisions of a fresh run land a beat late; harmless, don't tune it.
-- **Ports are homelab-negotiated.** Console is on **8085** (8080 is qBittorrent's WebUI on this box); all host ports are bound to 127.0.0.1 only.
+- 60 000 tickets at 100 events/s: no end-to-end loss. The fast/model split was
+  95.02/4.98. All four consumer groups drained.
+
+- Fast path p95 was 81 ms. Model path p95 was 467 ms.
+
+- Model runtime was 15.72 decisions/s. In-process p95 was 64.1 ms.
+
+- Chaos restart at t=180 s: alerts deduped by `decision_id`. The rate limit
+  held at 10 delivered alerts per minute.
+
+- ClickHouse current state matched Postgres after the CDC test.
+
+The device matrix and runtime options are in
+[docs/model-runtime.md](docs/model-runtime.md). Restart, degraded-mode, and
+dedupe notes are in [docs/operations.md](docs/operations.md).
 
 ## Configuration
 
-Everything is environment-driven via `.env` (copy `.env.example`; never commit it). Key groups:
+Everything is environment-driven through `.env`. Copy `.env.example` and never
+commit `.env`.
 
-| group | vars | notes |
+| group | variables | notes |
 |---|---|---|
-| thresholds | `THRESHOLD_SCAM_P=0.35`, `THRESHOLD_ESCALATE_P=0.75` | from the S5 eval sweep (docs/jev_eval.md) |
-| notifier | `NOTIFY_PROVIDER=log\|mock\|telegram\|discord` (comma-list = fan-out), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `DISCORD_WEBHOOK_URL`, `ALERT_RATE_LIMIT_PER_MIN=10` | `log` is the safe default; failed deliveries never lose the alerts row |
-| model | `MODEL_ENDPOINT_URL` | default `http://model:8081/v1/systemone` (in-network container); a host-run `make model` needs `MODEL_HOST=0.0.0.0` and `MODEL_ENDPOINT_URL=http://host.docker.internal:8081/v1/systemone` **plus** a ufw rule (below) |
-| ports | `REDPANDA_CONSOLE_PORT=8085`, `POSTGRES_PORT=5432` | 127.0.0.1-bound; ClickHouse host ports 8123/9000 are fixed in docker-compose.yaml |
-| creds | `CLICKHOUSE_*`, `POSTGRES_*`, `REDPANDA_BOOTSTRAP` | dev defaults in .env.example |
+| thresholds | `THRESHOLD_SCAM_P=0.35`, `THRESHOLD_ESCALATE_P=0.75` | from the model eval sweep in [docs/jev_eval.md](docs/jev_eval.md) |
+| notifier | `NOTIFY_PROVIDER=log\|mock\|telegram\|discord` (comma list = fan-out), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `DISCORD_WEBHOOK_URL`, `ALERT_RATE_LIMIT_PER_MIN=10` | `log` is the safe default; a failed POST does not lose the alerts row |
+| model | `MODEL_ENDPOINT_URL` | default `http://model:8081/v1/systemone`; a host-run `make model` needs `MODEL_HOST=0.0.0.0` and a ufw rule (below) |
+| host tools | `REDPANDA_BOOTSTRAP`, `POSTGRES_*` | `udp-generate` and `udp-pg-mutate` read these from the shell; Compose reads `.env` for its own interpolation |
+| ports | `REDPANDA_CONSOLE_PORT=8085`, `POSTGRES_PORT=5432` | 127.0.0.1-bound; ClickHouse host ports 8123/9000 are fixed in `docker-compose.yaml` |
+| credentials | `CLICKHOUSE_*`, `POSTGRES_*` | dev defaults in `.env.example` |
+
+`udp-generate` reads `REDPANDA_BOOTSTRAP` from the environment. If you keep the
+value only in `.env`, export it in the shell or pass `--bootstrap`:
+
+```bash
+export REDPANDA_BOOTSTRAP=127.0.0.1:9092
+uv run udp-generate --count 10
+```
 
 ## Troubleshooting
 
-- **`make model` unreachable from decide** — the container cannot reach the host's 127.0.0.1, and ufw drops container→host traffic on this box. Either use the in-network model container (`make up-model`, the default), or run the host server with `MODEL_HOST=0.0.0.0`, point `MODEL_ENDPOINT_URL` at `http://host.docker.internal:8081/v1/systemone`, and allow docker subnets: `pkexec ufw allow from 172.16.0.0/12 to any port 8081 proto tcp`.
-- **Port already allocated** — qBittorrent owns 8080 (console uses 8085); check `docker compose ps` and the port table above; everything else on this box negotiates via `.env`.
-- **`localhost:9092` connect-refused lines from the generator** — librdkafka tries IPv6 `::1` first and logs a few `%3|FAIL|…` lines before falling back to IPv4; publishing succeeds (verified in every run). Silence it with `REDPANDA_BOOTSTRAP=127.0.0.1:9092`.
-- **Decisions missing after a crash** — expected, bounded, and by design: read-time dedupe + coverage SQL in smoke.sh tell you exactly what a replay did; a crash replays ≤ ~10s (checkpoint_limit 1024).
-- **Disk** — `docker compose down -v` wipes all four volumes (redpanda, clickhouse, postgres, conduit); data volumes grow with the stream (retention 7d on the topics). `/home` at 91% is the operator's problem, not the pipeline's — keep chaos artifacts in /tmp.
+- **`make model` is unreachable from decide.** The container cannot reach the
+  host's 127.0.0.1, and ufw drops container-to-host traffic on this box. Use
+  the in-network model container (`make up-model`), or run the host server with
+  `MODEL_HOST=0.0.0.0`, set
+  `MODEL_ENDPOINT_URL=http://host.docker.internal:8081/v1/systemone`, and allow
+  the Docker subnets: `pkexec ufw allow from 172.16.0.0/12 to any port 8081 proto tcp`.
+
+- **Port already in use.** qBittorrent owns 8080, so the Console uses 8085.
+  Check `docker compose ps` and the port table in
+  [docs/architecture.md](docs/architecture.md).
+
+- **`localhost:9092` connect-refused lines from the generator.** librdkafka
+  tries IPv6 `::1` before IPv4. The producer still publishes. To silence the
+  lines, export `REDPANDA_BOOTSTRAP=127.0.0.1:9092`.
+
+- **Decisions missing after a crash.** This is expected and bounded. A crash
+  replays at most about 10 s of traffic (`checkpoint_limit 1024`). The tables
+  are append logs. Dedupe at read time. See
+  [docs/operations.md](docs/operations.md).
+
+- **Disk use.** The topics keep 7 days. The ClickHouse tables are unbounded.
+  Monitor disk use and set a TTL before production.
 
 ## Repo scope
 
-**Realtime only.** Batch/dbt analytics is a separate repo at v2 — it will connect to the same ClickHouse, own the mart layer, and never alter raw tables here. The contract it will consume is already specified: [docs/v2-batch.md](docs/v2-batch.md).
+This repository is realtime only. Batch analytics moves to a separate repo at
+v2. That repo will connect to the same ClickHouse, own the mart layer, and not
+alter the raw tables here. The contract is in
+[docs/v2-batch.md](docs/v2-batch.md).
 
 ## Docs map
 
-[docs/architecture.md](docs/architecture.md) (components, decision path, failure semantics) · [docs/schemas.md](docs/schemas.md) (wire + table contracts) · [docs/rules.md](docs/rules.md) (the rule table, mirrored into decide.yaml) · [docs/jev_eval.md](docs/jev_eval.md) (model eval + latency analysis) · [docs/feasibility.md](docs/feasibility.md) (S0 ROCm spike) · [docs/CONNECTOR_LICENSES.md](docs/CONNECTOR_LICENSES.md) · [docs/v2-batch.md](docs/v2-batch.md).
+- [docs/architecture.md](docs/architecture.md): components, decision path,
+  failure semantics.
+- [docs/schemas.md](docs/schemas.md): wire and table contracts.
+- [docs/rules.md](docs/rules.md): human-readable mirror of the rule table.
+- [docs/acceptance.md](docs/acceptance.md): measured acceptance results.
+- [docs/operations.md](docs/operations.md): restart, degraded mode, dedupe,
+  retention.
+- [docs/model-runtime.md](docs/model-runtime.md): device matrix and runtime.
+- [docs/jev_eval.md](docs/jev_eval.md): model eval and latency analysis.
+- [docs/history/s0-feasibility.md](docs/history/s0-feasibility.md): early ROCm
+  spike log.
+- [docs/adr/0001-conduit-cdc.md](docs/adr/0001-conduit-cdc.md): why the CDC
+  path uses Conduit.
+- [docs/v2-batch.md](docs/v2-batch.md): v2 batch repo contract.

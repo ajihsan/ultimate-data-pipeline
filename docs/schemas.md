@@ -1,27 +1,30 @@
 # Domain schemas
 
-Every payload on a Kafka topic or ClickHouse row is one of the four pydantic
-models in `src/udp/schemas.py` plus the mapping-added `answers_json`
-serialization field on model_decisions (real topic payloads are therefore not
-bare-model-validatable), stamped `schema_version` (currently `1.0.0`)
-with `extra="forbid"` — unknown fields are a producer bug. For the full
-machine-readable schema, run `python -c "from udp.schemas import Ticket;
-import json; print(json.dumps(Ticket.model_json_schema()))"` (same for the
-other models).
+`Ticket` is the only model the runtime validates. The generator produces it,
+and the ingest pipeline mirrors its required fields in Bloblang. The other
+three models are contract fixtures. The Connect pipelines build the same shapes
+as JSON, and the tests validate the examples. Every payload carries
+`schema_version`. The ingest pipeline requires a non-empty value.
+
+For the machine-readable schema of `Ticket`, run:
+
+```bash
+python -c 'from udp.schemas import Ticket; import json; print(json.dumps(Ticket.model_json_schema()))'
+```
 
 **Validation status:** the generator produces pydantic-validated `Ticket`
-payloads (`--dry-run` output too). Decisions and alerts are produced by the
-bloblang mappings in `connect/decide.yaml` / `connect/notify.yaml` — their
-shape is the contract documented here and enforced by the ClickHouse table
-definitions plus the smoke/chaos SQL asserts, not by pydantic at runtime.
+payloads, including `--dry-run` output. The bloblang mappings in
+`connect/decide.yaml` and `connect/notify.yaml` produce decisions and alerts.
+This page documents their shape. The ClickHouse table definitions and the
+smoke/chaos SQL asserts enforce it. Pydantic does not run at runtime.
 
 **Latency contract:** producers set `Ticket.ingested_at` when the ticket
-enters the stream; deciders stamp `decided_at`. End-to-end latency is
+enters the stream. Deciders stamp `decided_at`. End-to-end latency is
 `p95 = decided_at - ingested_at`.
 
-The four `clickhouse/init.sql` tables also carry an `ingested_batch_ts
-DateTime64(3) DEFAULT now()` landing-provenance column (never written by the
-pipelines); `udp.app_users_cdc`'s equivalent is `landed_at`.
+The four `clickhouse/init.sql` tables carry an `ingested_batch_ts` column. It is
+`DateTime64(3) DEFAULT now()` and records landing provenance. The pipelines
+never write it. `udp.app_users_cdc` uses `landed_at` for the same purpose.
 
 ## Ticket — topic `tickets` → `udp.tickets_raw`
 
@@ -72,8 +75,8 @@ pipelines); `udp.app_users_cdc`'s equivalent is `landed_at`.
 |---|---|---|
 | `event_id` | str | same ticket as the decision (required) |
 | `schema_version` | str | default `"1.0.0"` |
-| `decision_id` | str | uuid4 hex; the notify dedupe key (required) |
-| `question_type` | str | which `/v1/systemone` head answered: `choice`, `score`, or `noul` (required) |
+| `decision_id` | str | stable notification key: `model:<event_id>` (required) |
+| `question_type` | str | primary head; the pipeline writes `choice` and also asks `escalate_now` (required) |
 | `answers` | object | raw `/v1/systemone` answers block, preserved verbatim (required) |
 | `escalate_probability` | float | in [0, 1] (required) |
 | `scam_probability` | float | in [0, 1] (required) |
@@ -89,7 +92,7 @@ pipelines); `udp.app_users_cdc`'s equivalent is `landed_at`.
 {
   "event_id": "9f0c8b7e6d5a4940b2f1c3d4e5f60718",
   "schema_version": "1.0.0",
-  "decision_id": "4f9c2a8e7b3d4a1f8c6e2d5b0a9f7e34",
+  "decision_id": "model:9f0c8b7e6d5a4940b2f1c3d4e5f60718",
   "question_type": "choice",
   "answers": {
     "escalate_now": {"type": "noul", "noul": 0.91, "confidence": 0.91},
@@ -110,8 +113,9 @@ pipelines); `udp.app_users_cdc`'s equivalent is `landed_at`.
 }
 ```
 
-On a degraded fallback, `answers` is `{"error": <message>}` and both
-probabilities are 0.
+The topic payload also carries `answers_json`, the string form of `answers`.
+The ClickHouse table stores only `answers_json`. On a degraded fallback,
+`answers` is `{"error": <message>}` and both probabilities are 0.
 
 ## AlertEvent — `udp.alerts` (ClickHouse-only, never a Kafka payload)
 
@@ -119,16 +123,16 @@ probabilities are 0.
 |---|---|---|
 | `event_id` | str | same ticket as the alert (required) |
 | `schema_version` | str | default `"1.0.0"` |
-| `decision_id` | str | originating verdict; fast path synthesizes `fast:<event_id>` (required) |
-| `channel` | str | `telegram`, `discord`, the fan-out list `telegram,discord`, or `mock` (the value recorded when no chat provider is configured: `log` or `mock` mode) (required) |
-| `suppressed` | bool | true = rate limiter dropped delivery, row still recorded (default false) |
+| `decision_id` | str | originating key: `fast:<event_id>` or `model:<event_id>` (required) |
+| `channel` | str | `log`, `mock`, `telegram`, `discord`, or the fan-out list `telegram,discord` (required) |
+| `suppressed` | bool | true = rate limiter dropped delivery; false = not rate-limited, not a delivery guarantee (default false) |
 | `created_at` | datetime | alert attempt moment, tz-aware (required) |
 
 ```json
 {
   "event_id": "9f0c8b7e6d5a4940b2f1c3d4e5f60718",
   "schema_version": "1.0.0",
-  "decision_id": "4f9c2a8e7b3d4a1f8c6e2d5b0a9f7e34",
+  "decision_id": "model:9f0c8b7e6d5a4940b2f1c3d4e5f60718",
   "channel": "telegram,discord",
   "suppressed": false,
   "created_at": "2026-10-13T09:12:43.812000+00:00"

@@ -40,7 +40,7 @@ Measured end-to-end ceiling through a mock HTTP service: GPU p95 (64.1 ms) + HTT
   `/v1/systemone` contract.
 - Consumed through the **`laya` pip package (0.4.6)**:
   `laya.load("convaiinnovations/laya-typed-decisions", device="cuda")` →
-  `agent.predict(state, questions)`. No `trust_remote_code` gymnastics needed.
+  `agent.predict(state, questions)`. No `trust_remote_code` flag is necessary.
 - Observed answer shape (score type): `{"type": "score", "score": 1.64, "legend": {...},
   "probabilities": {"0": 0.015, "1": 0.33, "2": 0.655}, "confidence": 0.36, ...}`.
 - Device consistency check: same fixture scores 1.6401 (GPU, bf16-AMP) vs 1.6438
