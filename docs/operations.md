@@ -76,6 +76,13 @@ The first franz fetch after a pipeline start takes about 2–4.4 s for chunk
 warm-up. The first decisions of a fresh run arrive late. This is harmless. Do
 not tune it.
 
+## Upgrade note
+
+Model decision IDs changed from UUIDs to `model:<event_id>`. The new key makes
+a replay reuse the alert key. Alerts written before the change keep their UUIDs.
+A replayed ticket can therefore produce one extra alert at the cutover. Clear
+or migrate the old rows if you need a strict cutover.
+
 ## Topic creation
 
 The one-shot `redpanda-init` service creates the topics. If you add a topic

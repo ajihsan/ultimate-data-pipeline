@@ -31,7 +31,8 @@
 # is reachable from the LAN. Memory caps: redpanda 1.5G, clickhouse 3G (with a
 # 2.5G server-side ceiling), postgres 256m, console 200m, connect 250m each,
 # conduit 250m.
-# Connect metrics are republished on the host as 4196 (ingest) / 4197 (decide).
+# Connect metrics are republished on the host as 4196 (ingest), 4197 (decide),
+# 4198 (notify), and 4199 (cdc).
 
 name: udp
 
