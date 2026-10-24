@@ -304,7 +304,7 @@ output:
   switch:
     strict_mode: true
     cases:
-      - check: 'this.dedupe_checked == true && this.suppressed == false'
+      - check: 'this.dedupe_checked == true'
         output:
           sql_insert:
             driver: clickhouse
@@ -322,36 +322,17 @@ output:
                 this.decision_id,
                 this.event_id,
                 this.channel,
-                false,
+                this.suppressed,
                 this.created_at.ts_format("2006-01-02 15:04:05.999", "UTC"),
                 this.schema_version,
               ]
             batching:
               count: 1
-      - check: 'this.dedupe_checked == true && this.suppressed == true'
+      # A message that never finalized (dedupe or rate restore failure) must be
+      # nacked for redelivery, not silently dropped.
+      - check: 'this.dedupe_checked != true'
         output:
-          sql_insert:
-            driver: clickhouse
-            dsn: ${CLICKHOUSE_DSN}
-            table: alerts
-            columns:
-              - decision_id
-              - event_id
-              - channel
-              - suppressed
-              - created_at
-              - schema_version
-            args_mapping: |
-              root = [
-                this.decision_id,
-                this.event_id,
-                this.channel,
-                true,
-                this.created_at.ts_format("2006-01-02 15:04:05.999", "UTC"),
-                this.schema_version,
-              ]
-            batching:
-              count: 1
+          reject: "notification was not finalized"
 
 metrics:
   prometheus: {}
