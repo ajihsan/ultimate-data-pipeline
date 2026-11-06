@@ -10,7 +10,6 @@ from pyflink.common.serialization import SimpleStringSchema
 from pyflink.datastream import StreamExecutionEnvironment
 from pyflink.datastream.connectors.clickhouse import ClickHouseSink
 from pyflink.datastream.connectors.kafka import KafkaOffsetsInitializer, KafkaSource
-
 from redactor import PIIRedactor
 
 

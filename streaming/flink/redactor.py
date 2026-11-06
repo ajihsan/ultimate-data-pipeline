@@ -1,6 +1,5 @@
 import hashlib
 import re
-from typing import Optional
 
 
 class PIIRedactor:
@@ -69,7 +68,7 @@ class PIIRedactor:
             result = self.mask(result, pii_type)
         return result
 
-    def redact_text(self, text: Optional[str]) -> str:
+    def redact_text(self, text: str | None) -> str:
         """Redact nullable text field.
 
         Args:

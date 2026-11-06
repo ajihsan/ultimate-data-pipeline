@@ -1,6 +1,6 @@
-from pydantic import BaseModel
-from typing import Optional
 from datetime import datetime
+
+from pydantic import BaseModel
 
 
 class MastodonAccount(BaseModel):
@@ -8,9 +8,9 @@ class MastodonAccount(BaseModel):
 
     id: str
     username: str
-    display_name: Optional[str] = None
-    url: Optional[str] = None
-    avatar: Optional[str] = None
+    display_name: str | None = None
+    url: str | None = None
+    avatar: str | None = None
 
 
 class MastodonPayload(BaseModel):
@@ -22,7 +22,7 @@ class MastodonPayload(BaseModel):
     account: MastodonAccount
     visibility: str
     sensitive: bool
-    language: Optional[str] = None
+    language: str | None = None
     uri: str
     url: str
     replies_count: int = 0
@@ -36,7 +36,7 @@ class MastodonEvent(BaseModel):
     event_type: str
     payload: MastodonPayload
     timestamp_ms: int
-    stream_type: Optional[str] = None
+    stream_type: str | None = None
 
 
 class RedactedMastodonEvent(BaseModel):
@@ -49,7 +49,7 @@ class RedactedMastodonEvent(BaseModel):
     content_redacted: str
     visibility: str
     sensitive: bool
-    language: Optional[str]
+    language: str | None
     uri: str
     url: str
     replies_count: int

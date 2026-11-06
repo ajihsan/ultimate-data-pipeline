@@ -1,5 +1,5 @@
 import re
-from typing import Optional
+from typing import ClassVar
 
 
 class PIIDetector:
@@ -11,7 +11,7 @@ class PIIDetector:
     SSN_PATTERN = re.compile(r"\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b")
     IP_ADDRESS_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
-    PATTERNS = {
+    PATTERNS: ClassVar[dict[str, re.Pattern[str]]] = {
         "email": EMAIL_PATTERN,
         "phone": PHONE_PATTERN,
         "credit_card": CREDIT_CARD_PATTERN,
@@ -38,7 +38,7 @@ class PIIDetector:
 
         return len(detected_types) > 0, detected_types
 
-    def detect_all(self, fields: dict[str, Optional[str]]) -> tuple[bool, list[str]]:
+    def detect_all(self, fields: dict[str, str | None]) -> tuple[bool, list[str]]:
         """Detect PII over multiple text fields.
 
         Args:
@@ -48,7 +48,7 @@ class PIIDetector:
             Tuple[bool, List[str]]: Whether any PII was found and deduplicated types.
         """
         all_detected = []
-        for field_name, value in fields.items():
+        for value in fields.values():
             if value:
                 _, detected = self.detect(value)
                 all_detected.extend(detected)

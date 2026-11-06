@@ -15,7 +15,7 @@ BATCH_SRC = Path(__file__).resolve().parents[2] / "src"
 if str(BATCH_SRC) not in sys.path:
     sys.path.append(str(BATCH_SRC))
 
-from pipeline import BatchPipelineConfig, run_batch_pipeline  # noqa: E402
+from pipeline import BatchPipelineConfig, run_batch_pipeline
 
 
 @dataclass(slots=True)

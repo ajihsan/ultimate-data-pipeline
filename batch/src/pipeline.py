@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -52,7 +52,7 @@ def run_batch_pipeline(
     Returns:
         Dict[str, Any]: Summary metadata for processed files and row counts.
     """
-    run_date = execution_date or datetime.utcnow()
+    run_date = execution_date or datetime.now(UTC)
 
     extractor = _build_extractor(config)
     loader = ParquetLoader(base_path=config.target_base_path)
