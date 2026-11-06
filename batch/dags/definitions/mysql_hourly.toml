@@ -1,0 +1,39 @@
+dag_id = "batch_mysql_hourly"
+schedule = "@hourly"
+
+[source]
+type = "mysql"
+dsn_env = "MYSQL_DSN"
+query = """
+SELECT
+  t.id AS transaction_id,
+  u.id AS user_id,
+  u.name AS user_name,
+  u.email AS user_email,
+  p.id AS product_id,
+  p.name AS product_name,
+  p.category AS product_category,
+  t.quantity AS quantity,
+  p.unit_price AS unit_price,
+  (t.quantity * p.unit_price) AS gross_amount,
+  t.currency AS currency,
+  t.payment_method AS payment_method,
+  t.status AS transaction_status,
+  t.transaction_ts AS transaction_ts,
+  'mysql' AS source_system,
+  NOW() AS extracted_at
+FROM transactions t
+JOIN users u ON u.id = t.user_id
+JOIN products p ON p.id = t.product_id
+"""
+chunk_size = 5000
+
+[target]
+dataset = "mysql_transactions"
+base_path = "/opt/airflow/data"
+
+[clickhouse]
+url_env = "CLICKHOUSE_URL"
+user_env = "CLICKHOUSE_USER"
+password_env = "CLICKHOUSE_PASSWORD"
+database = "default"

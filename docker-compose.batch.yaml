@@ -1,0 +1,97 @@
+services:
+  airflow:
+    image: apache/airflow:3.0.0-python3.12
+    container_name: airflow
+    command: standalone
+    ports:
+      - "8080:8080"
+    environment:
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
+      - PYTHONPATH=/opt/airflow/dags:/opt/airflow/batch/src
+      - MYSQL_DSN=${MYSQL_DSN:-root:root@mysql:3306/app}
+      - POSTGRES_DSN=${POSTGRES_DSN:-postgresql://postgres:postgres@postgres:5432/app}
+      - CLICKHOUSE_URL=${CLICKHOUSE_URL:-http://clickhouse:8123}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER:-default}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-}
+    volumes:
+      - ./batch/dags:/opt/airflow/dags
+      - ./batch/src:/opt/airflow/batch/src
+      - batch_data:/opt/airflow/data
+    depends_on:
+      - clickhouse
+      - garage
+      - mysql
+      - postgres
+    networks:
+      - batch
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.4
+    container_name: clickhouse-batch
+    ports:
+      - "18123:8123"
+      - "19000:9000"
+    environment:
+      - CLICKHOUSE_DB=default
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-}
+    volumes:
+      - batch_data:/var/lib/clickhouse/user_files/batch_data
+      - ./src/clickhouse/schemas:/docker-entrypoint-initdb.d
+      - clickhouse_batch_data:/var/lib/clickhouse
+    networks:
+      - batch
+
+  garage:
+    image: dxflrs/garage:latest
+    container_name: garage
+    command: server
+    ports:
+      - "3900:3900"
+      - "3901:3901"
+      - "3902:3902"
+    volumes:
+      - garage_data:/var/lib/garage
+    networks:
+      - batch
+
+  mysql:
+    image: mysql:8.0
+    container_name: mysql-batch
+    environment:
+      - MYSQL_ROOT_PASSWORD=root
+      - MYSQL_DATABASE=app
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./batch/bootstrap/mysql-init.sql:/docker-entrypoint-initdb.d/init.sql
+      - mysql_batch_data:/var/lib/mysql
+    networks:
+      - batch
+
+  postgres:
+    image: postgres:16
+    container_name: postgres-batch
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=app
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./batch/bootstrap/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_batch_data:/var/lib/postgresql/data
+    networks:
+      - batch
+
+networks:
+  batch:
+    driver: bridge
+
+volumes:
+  batch_data:
+  garage_data:
+  clickhouse_batch_data:
+  mysql_batch_data:
+  postgres_batch_data:
