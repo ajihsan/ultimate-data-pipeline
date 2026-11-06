@@ -1,0 +1,49 @@
+input:
+  label: mastodon_stream_source
+  type: http_client
+  url: ${MASTODON_STREAM_URL}
+  verb: GET
+  headers:
+    Authorization: Bearer ${MASTODON_ACCESS_TOKEN}
+  stream:
+    enabled: true
+    reconnect: true
+    max_reconnects: 0
+  timeout: 0s
+
+pipeline:
+  processors:
+    - mapping: |
+        root.id = this.payload.id
+        root.event_type = this.event
+        root.payload = this.payload
+        root.stream_type = meta("stream_type")
+        root.timestamp_ms = now_ts()
+        root.account_id = this.payload.account.id
+        root.account_username = this.payload.account.username
+        root.content = this.payload.content
+        root.created_at = this.payload.created_at
+        root.visibility = this.payload.visibility
+        root.sensitive = this.payload.sensitive
+        root.language = this.payload.language
+        root.uri = this.payload.uri
+        root.url = this.payload.url
+        root.replies_count = this.payload.replies_count
+        root.reblogs_count = this.payload.reblogs_count
+        root.favourites_count = this.payload.favourites_count
+
+output:
+  label: redpanda_mastodon_output
+  type: redpanda
+  seed_brokers:
+    - ${REDPANDA_BROKERS}
+  topic: stream.mastodon.raw
+  schema_registry:
+    url: ${SCHEMA_REGISTRY_URL}
+  partitioner:
+    type: round_robin
+  ack_replicas: true
+  max_in_flight: 1
+  batching:
+    count: 50
+    period: 500ms

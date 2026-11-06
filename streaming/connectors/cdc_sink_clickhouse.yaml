@@ -1,0 +1,42 @@
+input:
+  label: redpanda_cdc_consumer
+  type: redpanda
+  seed_brokers:
+    - ${REDPANDA_BROKERS}
+  topics:
+    - db.cdc.users
+    - db.cdc.products
+    - db.cdc.transactions
+  consumer_group: cdc_clickhouse_sink
+  schema_registry:
+    url: ${SCHEMA_REGISTRY_URL}
+  auto_replay_nacks: true
+
+pipeline:
+  processors:
+    - mapping: |
+        root._operation = this.operation
+        root._timestamp = this.timestamp_ms
+        root._table = this.table_name
+        root._before = this.before
+        root._after = this.after
+
+output:
+  label: clickhouse_cdc_sink
+  type: clickhouse
+  dsn: ${CLICKHOUSE_DSN}
+  table: staging_cdc_events
+  compression: zstd
+  format: json_each_row
+  batching:
+    count: 1000
+    period: 5s
+    byte_size: 0
+
+error_handler:
+  type: retry
+  max_retries: 3
+  backoff:
+    initial_interval: 1s
+    max_interval: 30s
+    multiplier: 2

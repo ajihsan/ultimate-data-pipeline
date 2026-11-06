@@ -1,0 +1,51 @@
+input:
+  label: redpanda_mastodon_raw_consumer
+  type: redpanda
+  seed_brokers:
+    - ${REDPANDA_BROKERS}
+  topics:
+    - stream.mastodon.raw
+  consumer_group: mastodon_raw_clickhouse_sink
+  schema_registry:
+    url: ${SCHEMA_REGISTRY_URL}
+  auto_replay_nacks: true
+
+pipeline:
+  processors:
+    - mapping: |
+        root.event_id = if this.id != null { this.id } else { this.payload.id }
+        root.event_type = if this.event_type != null { this.event_type } else { this.event }
+        root.account_id = if this.account_id != null { this.account_id } else { this.payload.account.id }
+        root.account_username = if this.account_username != null { this.account_username } else { this.payload.account.username }
+        root.content_raw = if this.content != null { this.content } else { this.payload.content }
+        root.created_at = if this.created_at != null { this.created_at } else { this.payload.created_at }
+        root.visibility = if this.visibility != null { this.visibility } else { this.payload.visibility }
+        root.sensitive = if this.sensitive != null { this.sensitive } else { this.payload.sensitive }
+        root.language = if this.language != null { this.language } else { this.payload.language }
+        root.uri = if this.uri != null { this.uri } else { this.payload.uri }
+        root.url = if this.url != null { this.url } else { this.payload.url }
+        root.replies_count = if this.replies_count != null { this.replies_count } else { this.payload.replies_count }
+        root.reblogs_count = if this.reblogs_count != null { this.reblogs_count } else { this.payload.reblogs_count }
+        root.favourites_count = if this.favourites_count != null { this.favourites_count } else { this.payload.favourites_count }
+        root.timestamp_ms = this.timestamp_ms
+        root.payload_raw = this.payload.format_json()
+
+output:
+  label: clickhouse_mastodon_raw_sink
+  type: clickhouse
+  dsn: ${CLICKHOUSE_DSN}
+  table: streaming.staging_mastodon_raw
+  compression: zstd
+  format: json_each_row
+  batching:
+    count: 1000
+    period: 5s
+    byte_size: 0
+
+error_handler:
+  type: retry
+  max_retries: 3
+  backoff:
+    initial_interval: 1s
+    max_interval: 30s
+    multiplier: 2

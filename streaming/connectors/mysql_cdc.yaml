@@ -1,0 +1,38 @@
+input:
+  label: mysql_cdc_source
+  type: sql_mysql_cdc
+  dsn: ${MYSQL_DSN}
+  tables:
+    - ${MYSQL_DATABASE}.users
+    - ${MYSQL_DATABASE}.products
+    - ${MYSQL_DATABASE}.transactions
+  server_id: 1
+  snapshot:
+    mode: when_needed
+    threads: 4
+
+pipeline:
+  processors:
+    - mapping: |
+        root.table_name = this.table
+        root.operation = this.op
+        root.timestamp_ms = this.ts_ms
+        root.before = this.before
+        root.after = this.after
+        root.primary_keys = this.primary_keys
+
+output:
+  label: redpanda_cdc_output
+  type: redpanda
+  seed_brokers:
+    - ${REDPANDA_BROKERS}
+  topic: db.cdc.${! this.table_name }
+  schema_registry:
+    url: ${SCHEMA_REGISTRY_URL}
+  partitioner:
+    type: fnv1a128
+  ack_replicas: true
+  max_in_flight: 1
+  batching:
+    count: 100
+    period: 1s

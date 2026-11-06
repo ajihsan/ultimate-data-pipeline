@@ -1,0 +1,86 @@
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v25.3.7
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --kafka-addr=0.0.0.0:9092
+      - --advertise-kafka-addr=redpanda:9092
+      - --schema-registry-addr=0.0.0.0:8081
+      - --advertise-schema-registry-url=redpanda:8081
+      - --mode=development
+      - --smp=1
+      - --memory=512M
+    ports:
+      - "9092:9092"
+      - "8081:8081"
+      - "8082:8082"
+    networks:
+      - streaming
+
+  redpanda-connect:
+    image: docker.redpanda.com/redpandadata/connectors:latest
+    container_name: redpanda-connect
+    depends_on:
+      - redpanda
+      - clickhouse
+    environment:
+      - CONNECT_BOOTSTRAP_SERVERS=redpanda:9092
+      - CONNECT_GROUP_ID=connect-cluster
+      - CONNECT_CONFIG_STORAGE_TOPIC=connect-configs
+      - CONNECT_OFFSET_STORAGE_TOPIC=connect-offsets
+      - CONNECT_STATUS_STORAGE_TOPIC=connect-status
+      - CONNECT_KEY_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_AUTO_CREATE_TOPICS_ENABLE=true
+    volumes:
+      - ./streaming/connectors:/connectors
+    networks:
+      - streaming
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.4
+    container_name: clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      - CLICKHOUSE_DB=default
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-}
+    volumes:
+      - ./src/clickhouse/schemas:/docker-entrypoint-initdb.d
+      - clickhouse_data:/var/lib/clickhouse
+    networks:
+      - streaming
+
+  flink-jobmanager:
+    image: flink:1.20.1-scala_2.12-java17
+    container_name: flink-jobmanager
+    ports:
+      - "8084:8081"
+    command: jobmanager
+    environment:
+      - FLINK_PROPERTIES=jobmanager.rpc.address=flink-jobmanager
+    networks:
+      - streaming
+
+  flink-taskmanager:
+    image: flink:1.20.1-scala_2.12-java17
+    container_name: flink-taskmanager
+    depends_on:
+      - flink-jobmanager
+    command: taskmanager
+    scale: 1
+    environment:
+      - FLINK_PROPERTIES=jobmanager.rpc.address=flink-jobmanager
+    networks:
+      - streaming
+
+networks:
+  streaming:
+    driver: bridge
+
+volumes:
+  clickhouse_data:
