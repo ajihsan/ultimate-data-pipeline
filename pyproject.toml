@@ -1,0 +1,39 @@
+[project]
+name = "ultimate-data-pipeline"
+version = "0.1.0"
+description = "Unified batch and streaming data pipeline"
+requires-python = ">=3.12"
+dependencies = [
+    "apache-airflow>=3.0.0",
+    "psycopg2-binary>=2.9.0",
+    "aiomysql>=0.2.0",
+    "pandas>=2.0.0",
+    "pyarrow>=15.0.0",
+    "apache-flink>=1.20.0",
+    "avro>=1.11.0",
+    "fastavro>=1.9.0",
+    "pydantic>=2.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.4.0",
+    "pyrefly>=0.0.14",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

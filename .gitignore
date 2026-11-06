@@ -6,3 +6,9 @@ cache*
 blob*
 *.log
 .cache
+.env
+.DS_Store
+.venv/
+
+# Opencode
+.opencode
